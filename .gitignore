@@ -1,0 +1,8 @@
+rhelguard_reports/
+*.log
+/tmp/
+lynis*/
+# Keep example reports out of git
+*.json
+*.html
+!docs/
