@@ -8,7 +8,7 @@
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝
 #
 #  RHELGuard — Red Hat Enterprise Linux Security Audit Tool
-#  Version : 2.1.0
+#  Version : 2.2.0
 #  Covers  : RHEL 5, 6, 7, 8, 9, 10 (auto-detected)
 #  Sources : CIS Benchmarks (L1/L2) + DISA STIG v2 + Lynis-style posture
 #  License : MIT
@@ -18,10 +18,15 @@
 #   sudo  ./rhelguard.sh [OPTIONS]           # full scan (recommended)
 #
 # OPTIONS:
-#   -m, --mode       cis | stig | posture | all   (default: all)
+#   -m, --mode       cis | stig | posture | airgap | all  (default: all)
 #   -o, --output     Output directory             (default: ./rhelguard_reports)
 #   -t, --throttle   ms between checks            (default: 50)
-#   -s, --skip-lynis Skip Lynis integration
+#   -b, --baseline   Previous RHELGuard JSON — report drift since then
+#   -w, --waivers    Waiver file: "CHECK-ID | reason" per line
+#   -a, --max-patch-age  Days before patch age is flagged     (default: 90)
+#   -B, --bundle     Pack reports + SHA256SUMS + manifest into a tar.gz
+#       --strict     Exit code 2 if any FAIL remains (for automation)
+#   -s, --skip-lynis No-op (kept for backward compatibility)
 #   -q, --quiet      Suppress per-check console output
 #   -h, --help       Show this help
 #
@@ -31,24 +36,36 @@
 #   - Non-root mode: skips privileged checks cleanly, runs everything else.
 #   - No network probing, no port scanning, no package installs.
 #   - AIR-GAP SAFE: zero external dependencies — pure bash + standard RHEL tools
-#     (awk, sed, grep, stat, rpm, systemctl). No python3, no bc, no curl needed.
-#     To use Lynis offline: place lynis-*.tar.gz next to this script.
+#     (awk, sed, grep, find, stat, rpm). No python3, no bc, no curl needed.
+#   - Reports are written with umask 077 (they describe your weaknesses).
 # =============================================================================
 
-set -euo pipefail
+# NOTE: deliberately NOT using `set -e` / `pipefail`. Under those options any
+# benign non-zero status (find hitting a permission-denied dir as non-root,
+# grep -c matching nothing, [[ ]] false in quiet mode) aborted the whole scan
+# with no report. Every check handles its own errors instead.
+set +e
+umask 077
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 readonly TOOL_NAME="RHELGuard"
-readonly TOOL_VERSION="2.1.0"
+readonly TOOL_VERSION="2.2.0"
 SCAN_MODE="all"
 OUTPUT_DIR="./rhelguard_reports"
 THROTTLE_MS=50
-SKIP_LYNIS=false
 QUIET=false
-LYNIS_BIN=""
-LYNIS_TAR=""          # path to local tarball for air-gapped Lynis
+BASELINE_FILE=""      # previous JSON report for drift comparison
+WAIVER_FILE=""        # accepted deviations: "ID | reason"
+WAIVER_DATA=""        # loaded waiver lines
+MAX_PATCH_AGE=90      # days
+BUNDLE=false
+STRICT=false
+SEEN_IDS="|"          # used to guarantee unique check IDs (bash 3.2 safe, no assoc arrays)
+SCRIPT_PATH="$0"
+SCRIPT_SHA256="unavailable"
+DRIFT_NEW_FAIL=0; DRIFT_FIXED=0; DRIFT_CHANGED=0
 START_TS=$(date +%s)
 REPORT_TS=$(date +"%Y%m%d_%H%M%S")
 HOSTNAME_VAL=$(hostname -s 2>/dev/null || echo "unknown")
@@ -58,11 +75,14 @@ IS_ROOT=false
 [[ $EUID -eq 0 ]] && IS_ROOT=true
 
 # Counters
-PASS=0; FAIL=0; WARN=0; INFO=0; SKIP=0; TOTAL=0; PRIV_SKIP=0
+PASS=0; FAIL=0; WARN=0; INFO=0; SKIP=0; WAIVED=0; TOTAL=0; PRIV_SKIP=0
 
 # Results written line-by-line as JSON objects to a temp file
 RESULTS_FILE=$(mktemp /tmp/rhelguard_results.XXXXXX)
-trap 'rm -f "$RESULTS_FILE"' EXIT
+HTML_ROWS_FILE=$(mktemp /tmp/rhelguard_rows.XXXXXX)
+CSV_ROWS_FILE=$(mktemp /tmp/rhelguard_csv.XXXXXX)
+DRIFT_FILE=$(mktemp /tmp/rhelguard_drift.XXXXXX)
+trap 'rm -f "$RESULTS_FILE" "$HTML_ROWS_FILE" "$CSV_ROWS_FILE" "$DRIFT_FILE"' EXIT
 
 # Detected RHEL version (set in detect_os)
 RHEL_MAJOR=0
@@ -74,32 +94,12 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; RESET='\033[0m'
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PURE-BASH JSON FIELD EXTRACTOR — no python3/jq/bc needed (air-gap safe)
-# Extracts a string value from a single flat JSON object line.
-# Usage: json_field "key" '{"key":"value","other":"x"}'
+# PORTABLE TIMEOUT — `timeout` is not in RHEL 5 coreutils. Without it the old
+# code silently returned "0" (false PASS). Now we run the command unbounded.
 # ─────────────────────────────────────────────────────────────────────────────
-json_field() {
-    local key="$1" line="$2"
-    # Match "key":"value" — handles escaped quotes inside value via greedy workaround
-    # Uses parameter expansion only — zero external tools
-    local after="${line#*\"${key}\":\"}"   # strip up to and including "key":"
-    if [[ "$after" == "$line" ]]; then
-        echo ""; return                    # key not found
-    fi
-    # Now strip from the first unescaped closing quote onward
-    # We iterate char by char to handle \\" sequences correctly
-    local result="" c prev=""
-    local i=0 len="${#after}"
-    while [[ $i -lt $len ]]; do
-        c="${after:$i:1}"
-        if [[ "$c" == '"' && "$prev" != '\' ]]; then
-            break
-        fi
-        result="${result}${c}"
-        prev="$c"
-        (( i++ )) || true
-    done
-    echo "$result"
+run_to() {
+    local secs="$1"; shift
+    if command -v timeout &>/dev/null; then timeout "$secs" "$@"; else "$@"; fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ json_field() {
 # ─────────────────────────────────────────────────────────────────────────────
 check_deps() {
     # These are REQUIRED — present on every RHEL 5+ system
-    local required=(awk sed grep find stat rpm systemctl uname date hostname)
+    local required=(awk sed grep find stat rpm uname date hostname)
     local missing=()
     for t in "${required[@]}"; do
         command -v "$t" &>/dev/null || missing+=("$t")
@@ -120,7 +120,7 @@ check_deps() {
     fi
 
     # These are OPTIONAL — degrade gracefully if absent
-    local optional=(sshd getenforce sestatus ss findmnt auditctl lsblk blkid ip mokutil chage)
+    local optional=(systemctl sshd getenforce sestatus ss findmnt auditctl lsblk blkid ip mokutil chage sha256sum tar)
     local absent=()
     for t in "${optional[@]}"; do
         command -v "$t" &>/dev/null || absent+=("$t")
@@ -131,20 +131,20 @@ check_deps() {
 
     # Explicitly note that no internet is needed
     log "Air-gap safe: all checks use local system state only."
-    log "No network connections made (Lynis auto-skipped if curl absent)."
+    log "No outbound network connections are made by any check."
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSOLE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-log()      { [[ "$QUIET" == false ]] && echo -e "${CYAN}[*]${RESET} $*"; }
-log_ok()   { [[ "$QUIET" == false ]] && echo -e "${GREEN}[PASS]${RESET} $*"; }
-log_fail() { [[ "$QUIET" == false ]] && echo -e "${RED}[FAIL]${RESET} $*"; }
-log_warn() { [[ "$QUIET" == false ]] && echo -e "${YELLOW}[WARN]${RESET} $*"; }
-log_info() { [[ "$QUIET" == false ]] && echo -e "${BOLD}[INFO]${RESET} $*"; }
-log_skip() { [[ "$QUIET" == false ]] && echo -e "      [SKIP] $*"; }
-banner()   { [[ "$QUIET" == false ]] && echo -e "\n${BOLD}${CYAN}━━━ $* ━━━${RESET}\n"; }
+log()      { [[ "$QUIET" == false ]] && echo -e "${CYAN}[*]${RESET} $*"; return 0; }
+log_ok()   { [[ "$QUIET" == false ]] && echo -e "${GREEN}[PASS]${RESET} $*"; return 0; }
+log_fail() { [[ "$QUIET" == false ]] && echo -e "${RED}[FAIL]${RESET} $*"; return 0; }
+log_warn() { [[ "$QUIET" == false ]] && echo -e "${YELLOW}[WARN]${RESET} $*"; return 0; }
+log_info() { [[ "$QUIET" == false ]] && echo -e "${BOLD}[INFO]${RESET} $*"; return 0; }
+log_skip() { [[ "$QUIET" == false ]] && echo -e "      [SKIP] $*"; return 0; }
+banner()   { [[ "$QUIET" == false ]] && echo -e "\n${BOLD}${CYAN}━━━ $* ━━━${RESET}\n"; return 0; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRODUCTION THROTTLE
@@ -184,21 +184,66 @@ record_result() {
 
 _write_result() {
     local status="$1" id="$2" title="$3" cat="$4" desc="$5" rem="$6"
+
+    # ── Guarantee unique check IDs (needed for baselines + waivers) ──────────
+    local base_id="$id" n=1
+    while [[ "$SEEN_IDS" == *"|${id}|"* ]]; do
+        n=$(( n + 1 )); id="${base_id}.${n}"
+    done
+    SEEN_IDS="${SEEN_IDS}${id}|"
+
+    # ── Waivers: documented, accepted deviations (FAIL/WARN only) ───────────
+    if [[ -n "$WAIVER_DATA" && ( "$status" == "FAIL" || "$status" == "WARN" ) ]]; then
+        local wline wid wreason
+        while IFS= read -r wline; do
+            wid="${wline%%|*}"; wid="${wid//[[:space:]]/}"
+            if [[ -n "$wid" && ( "$wid" == "$id" || "$wid" == "$base_id" ) ]]; then
+                wreason="${wline#*|}"
+                [[ "$wreason" == "$wline" ]] && wreason="(no reason given)"
+                desc="WAIVED (was ${status}): ${wreason# } — ${desc}"
+                status="WAIVED"
+                break
+            fi
+        done <<< "$WAIVER_DATA"
+    fi
+
     TOTAL=$(( TOTAL + 1 ))
     case "$status" in
-        PASS) PASS=$(( PASS+1 )); log_ok  "$id — $title" ;;
-        FAIL) FAIL=$(( FAIL+1 )); log_fail "$id — $title" ;;
-        WARN) WARN=$(( WARN+1 )); log_warn "$id — $title" ;;
-        INFO) INFO=$(( INFO+1 )); log_info "$id — $title" ;;
-        SKIP) SKIP=$(( SKIP+1 )); log_skip "$id — $title" ;;
+        PASS)   PASS=$(( PASS+1 ));     log_ok   "$id — $title" ;;
+        FAIL)   FAIL=$(( FAIL+1 ));     log_fail "$id — $title" ;;
+        WARN)   WARN=$(( WARN+1 ));     log_warn "$id — $title" ;;
+        INFO)   INFO=$(( INFO+1 ));     log_info "$id — $title" ;;
+        SKIP)   SKIP=$(( SKIP+1 ));     log_skip "$id — $title" ;;
+        WAIVED) WAIVED=$(( WAIVED+1 )); log_info "$id — $title (waived)" ;;
     esac
-    # JSON-safe escaping
-    title=$(printf '%s' "$title"  | sed 's/\\/\\\\/g; s/"/\\"/g')
-    desc=$(printf  '%s' "$desc"   | sed 's/\\/\\\\/g; s/"/\\"/g')
-    rem=$(printf   '%s' "$rem"    | sed 's/\\/\\\\/g; s/"/\\"/g')
-    printf '{"id":"%s","status":"%s","title":"%s","category":"%s","description":"%s","remediation":"%s","rhel_ver":%d,"ts":"%s"}\n' \
-        "$id" "$status" "$title" "$cat" "$desc" "$rem" "$RHEL_MAJOR" "$(date -Iseconds)" \
-        >> "$RESULTS_FILE"
+
+    # ── One awk pass renders JSON, HTML and CSV rows with correct escaping ───
+    # Values go through ENVIRON (not -v) so backslashes are not re-interpreted.
+    # Handles quotes, backslashes, newlines, tabs and control characters —
+    # the old sed escaping produced invalid JSON on any multi-line value.
+    RG_S="$status" RG_I="$id" RG_T="$title" RG_C="$cat" RG_D="$desc" RG_R="$rem" \
+    RG_V="$RHEL_MAJOR" RG_TS="$(date -Iseconds 2>/dev/null || date)" \
+    RG_JF="$RESULTS_FILE" RG_HF="$HTML_ROWS_FILE" RG_CF="$CSV_ROWS_FILE" \
+    awk 'function j(x){ gsub(/\\/,"\\\\",x); gsub(/"/,"\\\"",x); gsub(/\t/,"\\t",x);
+                        gsub(/\r/,"",x); gsub(/\n/,"\\n",x);
+                        gsub(/[\001-\010\013\014\016-\037]/,"",x); return x }
+         function h(x){ gsub(/&/,"\\&amp;",x); gsub(/</,"\\&lt;",x); gsub(/>/,"\\&gt;",x);
+                        gsub(/"/,"\\&quot;",x); gsub(/\047/,"\\&#39;",x);
+                        gsub(/\n/,"<br>",x); return x }
+         function c(x){ gsub(/"/,"\"\"",x); gsub(/[\r\n]+/," ",x);
+                        if (x ~ /^[=+@-]/) x="\047" x;    # CSV/formula injection guard
+                        return "\"" x "\"" }
+         BEGIN{
+           S=ENVIRON["RG_S"]; I=ENVIRON["RG_I"]; T=ENVIRON["RG_T"]; C=ENVIRON["RG_C"]
+           D=ENVIRON["RG_D"]; R=ENVIRON["RG_R"]; V=ENVIRON["RG_V"]+0; TS=ENVIRON["RG_TS"]
+           printf "{\"id\":\"%s\",\"status\":\"%s\",\"title\":\"%s\",\"category\":\"%s\",\"description\":\"%s\",\"remediation\":\"%s\",\"rhel_ver\":%d,\"ts\":\"%s\"}\n", \
+             j(I),j(S),j(T),j(C),j(D),j(R),V,j(TS) >> ENVIRON["RG_JF"]
+           rem=""
+           if (R != "" && R != "N/A") rem="<div class=\"rem\">&#128295; " h(R) "</div>"
+           printf "<tr data-s=\"%s\"><td><span class=\"badge b-%s\">%s</span></td><td class=\"id-cell\">%s</td><td>%s</td><td><strong>%s</strong><br><small class=\"desc\">%s</small>%s</td></tr>\n", \
+             h(S),h(S),h(S),h(I),h(C),h(T),h(D),rem >> ENVIRON["RG_HF"]
+           printf "%s,%s,%s,%s,%s,%s\n", c(I),c(S),c(C),c(T),c(D),c(R) >> ENVIRON["RG_CF"]
+         }' </dev/null
     throttle
 }
 
@@ -251,7 +296,7 @@ rhel_is() { [[ "$RHEL_MAJOR" -eq "$1" ]] 2>/dev/null; }
 # ARGUMENT PARSING
 # ─────────────────────────────────────────────────────────────────────────────
 usage() {
-    grep "^# USAGE:" -A 30 "$0" | grep "^#" | sed 's/^# //'
+    grep "^# USAGE:" -A 45 "$0" | sed "/^# =/q" | grep "^#" | sed 's/^#[[:space:]]\{0,1\}//'
     exit 0
 }
 
@@ -259,15 +304,23 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -m|--mode)       SCAN_MODE="${2:-all}";   shift 2 ;;
+            -b|--baseline)   BASELINE_FILE="${2:-}";  shift 2 ;;
+            -w|--waivers)    WAIVER_FILE="${2:-}";    shift 2 ;;
+            -a|--max-patch-age) MAX_PATCH_AGE="${2:-90}"; shift 2 ;;
+            -B|--bundle)     BUNDLE=true;             shift ;;
+            --strict)        STRICT=true;             shift ;;
             -o|--output)     OUTPUT_DIR="${2:-$OUTPUT_DIR}"; shift 2 ;;
             -t|--throttle)   THROTTLE_MS="${2:-50}";  shift 2 ;;
-            -s|--skip-lynis) SKIP_LYNIS=true;         shift ;;
-            -l|--lynis-tar)  LYNIS_TAR="${2:-}";       shift 2 ;;
+            -s|--skip-lynis) shift ;;   # no-op, backward compatibility
             -q|--quiet)      QUIET=true;              shift ;;
             -h|--help)       usage ;;
             *) echo "Unknown option: $1"; usage ;;
         esac
     done
+    [[ "$THROTTLE_MS"   =~ ^[0-9]+$ ]] || { echo "Invalid --throttle: $THROTTLE_MS"; exit 1; }
+    [[ "$MAX_PATCH_AGE" =~ ^[0-9]+$ ]] || { echo "Invalid --max-patch-age: $MAX_PATCH_AGE"; exit 1; }
+    if [[ -n "$BASELINE_FILE" && ! -r "$BASELINE_FILE" ]]; then echo "Baseline not readable: $BASELINE_FILE"; exit 1; fi
+    if [[ -n "$WAIVER_FILE"   && ! -r "$WAIVER_FILE"   ]]; then echo "Waiver file not readable: $WAIVER_FILE"; exit 1; fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,7 +329,17 @@ parse_args() {
 preflight() {
     detect_os
     check_deps
-    mkdir -p "$OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR" || { echo "Cannot create output dir: $OUTPUT_DIR"; exit 1; }
+
+    # Chain of custody: record exactly which script build produced the report
+    if command -v sha256sum &>/dev/null && [[ -r "$SCRIPT_PATH" ]]; then
+        SCRIPT_SHA256=$(sha256sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
+    fi
+
+    if [[ -n "$WAIVER_FILE" ]]; then
+        WAIVER_DATA=$(grep -vE '^[[:space:]]*(#|$)' "$WAIVER_FILE" 2>/dev/null)
+        log "Waivers  : $(printf '%s\n' "$WAIVER_DATA" | grep -c . ) loaded from $WAIVER_FILE"
+    fi
 
     if [[ "$IS_ROOT" == false ]]; then
         echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗"
@@ -293,6 +356,7 @@ preflight() {
     log "Throttle : ${THROTTLE_MS}ms"
     log "As root  : ${IS_ROOT}"
     log "Output   : ${OUTPUT_DIR}"
+    log "SHA-256  : ${SCRIPT_SHA256}"
 }
 
 # =============================================================================
@@ -328,14 +392,14 @@ run_cis_checks() {
         grep -rqE "^\s*(blacklist|install)\s+${mod}" /etc/modprobe.d/ 2>/dev/null && bl=true
 
         if [[ "$loaded" == false && "$bl" == true ]]; then
-            record_result "PASS" "CIS-MOD" "Kernel module '$mod' disabled and blacklisted" \
+            record_result "PASS" "CIS-MOD-$mod" "Kernel module '$mod' disabled and blacklisted" \
                 "CONFIGURATION MANAGEMENT" "Module $mod is not loaded and is blacklisted." ""
         elif [[ "$loaded" == false ]]; then
-            record_result "WARN" "CIS-MOD" "Module '$mod' not loaded but not blacklisted" \
+            record_result "WARN" "CIS-MOD-$mod" "Module '$mod' not loaded but not blacklisted" \
                 "CONFIGURATION MANAGEMENT" "Module $mod is absent at runtime but not hardened." \
                 "echo 'install $mod /bin/false' >> /etc/modprobe.d/hardening.conf && echo 'blacklist $mod' >> /etc/modprobe.d/hardening.conf"
         else
-            record_result "FAIL" "CIS-MOD" "Kernel module '$mod' is loaded/available" \
+            record_result "FAIL" "CIS-MOD-$mod" "Kernel module '$mod' is loaded/available" \
                 "CONFIGURATION MANAGEMENT" "Module $mod is currently loaded." \
                 "modprobe -r $mod && echo 'install $mod /bin/false' >> /etc/modprobe.d/hardening.conf"
         fi
@@ -431,19 +495,30 @@ run_cis_checks() {
         fi
     fi
 
-    # Pending updates (lightweight check)
+    # Pending updates — cache-only (-C), never touches the network.
+    # On air-gapped hosts there is often NO local metadata cache; the old logic
+    # reported that as "up to date" (false PASS). Exit codes: 0=none, 100=updates.
     local pkg_mgr="dnf"
     rhel_le 7 && pkg_mgr="yum"
-    local pending=0
-    # -C = cache only, never hits the network
-    pending=$($pkg_mgr check-update -C --quiet 2>/dev/null | grep -c "^[a-zA-Z]" || echo 0)
-    if [[ "$pending" -eq 0 ]]; then
-        record_result "PASS" "CIS-PKG-4" "System packages are up to date" \
-            "SYSTEM INTEGRITY" "No pending updates detected." ""
+    if command -v "$pkg_mgr" &>/dev/null; then
+        local cu_out cu_rc pending
+        cu_out=$(run_to 90 "$pkg_mgr" check-update -C --quiet 2>/dev/null); cu_rc=$?
+        # count only "name.arch  version  repo" lines, not banner/metadata lines
+        pending=$(printf '%s\n' "$cu_out" | grep -cE '^[[:alnum:]_.+-]+\.[[:alnum:]_]+[[:space:]]+[0-9]' || true)
+        if [[ $cu_rc -eq 100 ]]; then
+            record_result "WARN" "CIS-PKG-4" "$pending pending package update(s) in local metadata" \
+                "SYSTEM INTEGRITY" "Local repo metadata lists $pending newer package(s). Freshness depends on when your internal mirror was last synced." \
+                "Sync the internal mirror/media, then: $pkg_mgr update"
+        elif [[ $cu_rc -eq 0 ]]; then
+            record_result "PASS" "CIS-PKG-4" "No pending updates in local repo metadata" \
+                "SYSTEM INTEGRITY" "No updates listed in cached metadata. See AIR-PATCH-1 for patch age — metadata may itself be stale." ""
+        else
+            record_result "SKIP" "CIS-PKG-4" "No usable local repo metadata cache" \
+                "SYSTEM INTEGRITY" "$pkg_mgr has no cached metadata (typical on air-gapped hosts). Patch currency is assessed by AIR-PATCH-1 instead." \
+                "$pkg_mgr makecache  (against your internal mirror or mounted media)"
+        fi
     else
-        record_result "WARN" "CIS-PKG-4" "$pending pending package update(s)" \
-            "SYSTEM INTEGRITY" "$pending packages have available updates." \
-            "Run: sudo $pkg_mgr update -y"
+        record_result "SKIP" "CIS-PKG-4" "$pkg_mgr not available" "SYSTEM INTEGRITY" "Package manager not found." ""
     fi
 
     # ── SELinux ───────────────────────────────────────────────────────────────
@@ -1231,11 +1306,11 @@ run_stig_checks() {
 
     for pkg in "${dangerous_pkgs[@]}"; do
         if rpm -q "$pkg" &>/dev/null 2>&1; then
-            record_result "FAIL" "STIG-PKG" "Dangerous package '$pkg' is installed" \
+            record_result "FAIL" "STIG-PKG-$pkg" "Dangerous package '$pkg' is installed" \
                 "CONFIGURATION MANAGEMENT" "$pkg should not be installed on this system." \
                 "dnf remove $pkg"
         else
-            record_result "PASS" "STIG-PKG" "Package '$pkg' is not installed" \
+            record_result "PASS" "STIG-PKG-$pkg" "Package '$pkg' is not installed" \
                 "CONFIGURATION MANAGEMENT" "$pkg is not present." ""
         fi
     done
@@ -1245,10 +1320,10 @@ run_stig_checks() {
         local required_pkgs=(openssl-pkcs11 gnutls-utils nss-tools rng-tools s-nail libreswan usbguard)
         for pkg in "${required_pkgs[@]}"; do
             if rpm -q "$pkg" &>/dev/null 2>&1; then
-                record_result "PASS" "STIG-REQPKG" "Required package '$pkg' is installed" \
+                record_result "PASS" "STIG-REQPKG-$pkg" "Required package '$pkg' is installed" \
                     "SYSTEM INTEGRITY" "$pkg is present as required by STIG." ""
             else
-                record_result "FAIL" "STIG-REQPKG" "Required package '$pkg' is NOT installed" \
+                record_result "FAIL" "STIG-REQPKG-$pkg" "Required package '$pkg' is NOT installed" \
                     "SYSTEM INTEGRITY" "$pkg is required by RHEL 9 STIG but missing." \
                     "dnf install $pkg"
             fi
@@ -1468,7 +1543,7 @@ run_posture_checks() {
     # RPM integrity (root only — can be slow, limited to quick pass)
     if needs_root "POS-FS-5" "RPM package file integrity check (rpm -Va)" "FILE INTEGRITY"; then
         # rpm -Va can be slow on large installs — capped at 30s with timeout
-        local rpm_changed; rpm_changed=$(timeout 30 rpm -Va --nofiledigest 2>/dev/null | grep -cE "^\.M\.|^S\." || echo "0")
+        local rpm_changed; rpm_changed=$(run_to 30 rpm -Va --nofiledigest 2>/dev/null | grep -cE "^\.M\.|^S\." || true)
         if [[ "$rpm_changed" -eq 0 ]]; then
             record_result "PASS" "POS-FS-5" "No modified RPM-owned files detected" \
                 "FILE INTEGRITY" "rpm -Va found no modified package files." ""
@@ -1564,13 +1639,13 @@ run_posture_checks() {
     banner "POSTURE — Network Exposure"
 
     # Listening services inventory
-    local listen_count; listen_count=$(ss -tlnp 2>/dev/null | grep -c "LISTEN" || echo "N/A")
+    local listen_count; listen_count=$(ss -tlnp 2>/dev/null | grep -c "LISTEN" || true)
     record_result "INFO" "POS-NET-1" "$listen_count listening TCP service(s) detected" \
         "NETWORK CONFIGURATION" "Review all listening ports and disable unneeded services." \
         "ss -tlnp"
 
     # Promiscuous mode interfaces (RHEL 9 STIG)
-    local promisc; promisc=$(ip link show 2>/dev/null | grep -c "PROMISC" || echo 0)
+    local promisc; promisc=$(ip link show 2>/dev/null | grep -c "PROMISC" || true)
     if [[ "$promisc" -eq 0 ]]; then
         record_result "PASS" "POS-NET-2" "No interfaces in promiscuous mode" \
             "NETWORK CONFIGURATION" "No promiscuous mode network interfaces detected." ""
@@ -1646,7 +1721,7 @@ run_hardening_scan() {
 
     # /etc/sudoers syntax + NOPASSWD (already in STIG but reinforced here)
     if [[ -f /etc/sudoers ]]; then
-        local nopasswd_count; nopasswd_count=$(grep -c "NOPASSWD" /etc/sudoers 2>/dev/null || echo 0)
+        local nopasswd_count; nopasswd_count=$(grep -c "NOPASSWD" /etc/sudoers 2>/dev/null; true)
         if [[ "$nopasswd_count" -eq 0 ]]; then
             record_result "PASS" "HRDN-AUTH-3" "No NOPASSWD entries in /etc/sudoers" \
                 "AUTHENTICATION" "All sudo rules require password." ""
@@ -1742,7 +1817,7 @@ run_hardening_scan() {
     local now_epoch; now_epoch=$(date +%s)
     while IFS= read -r certfile; do
         local exp_date exp_epoch
-        exp_date=$(timeout 3 openssl x509 -noout -enddate -in "$certfile" 2>/dev/null | cut -d= -f2) || continue
+        exp_date=$(run_to 3 openssl x509 -noout -enddate -in "$certfile" 2>/dev/null | cut -d= -f2) || continue
         exp_epoch=$(date -d "$exp_date" +%s 2>/dev/null) || continue
         local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
         if [[ "$days_left" -lt 0 ]]; then
@@ -1927,8 +2002,8 @@ run_hardening_scan() {
     fi
 
     # SELinux denials (recent)
-    if command -v aureport &>/dev/null 2>/dev/null; then
-        local avc_count; avc_count=$(timeout 10 aureport --avc 2>/dev/null | tail -n +7 | wc -l || echo "0")
+    if command -v aureport &>/dev/null; then
+        local avc_count; avc_count=$(run_to 10 aureport --avc 2>/dev/null | tail -n +7 | wc -l || echo "0")
         if [[ "$avc_count" -eq 0 ]]; then
             record_result "PASS" "HRDN-MALW-2" "No recent SELinux AVC denials in audit log" \
                 "SYSTEM INTEGRITY" "aureport --avc shows no recent denials." ""
@@ -2024,7 +2099,7 @@ run_hardening_scan() {
     banner "HARDENING [STRG] — Storage & USB"
 
     # USB storage kernel module
-    local usb_mod; usb_mod=$(lsmod 2>/dev/null | grep -c "^usb_storage" || echo 0)
+    local usb_mod; usb_mod=$(lsmod 2>/dev/null | grep -c "^usb_storage" || true)
     local usb_bl; usb_bl=$(grep -rqE "install usb.storage /bin/(false|true)" /etc/modprobe.d/ 2>/dev/null && echo 1 || echo 0)
     if [[ "$usb_mod" -eq 0 && "$usb_bl" -eq 1 ]]; then
         record_result "PASS" "HRDN-STRG-1" "USB mass storage is disabled and blacklisted" \
@@ -2057,7 +2132,7 @@ run_hardening_scan() {
     if [[ -f /etc/chrony.conf ]]; then
         ntp_servers=$(grep -cE "^\s*(server|pool)" /etc/chrony.conf 2>/dev/null || echo 0)
     elif [[ -f /etc/ntp.conf ]]; then
-        ntp_servers=$(grep -cE "^\s*server" /etc/ntp.conf 2>/dev/null || echo 0)
+        ntp_servers=$(grep -cE "^\s*server" /etc/ntp.conf 2>/dev/null; true)
     fi
     if [[ "$ntp_servers" -ge 2 ]]; then
         record_result "PASS" "HRDN-TIME-1" "$ntp_servers NTP server(s) configured (≥2 for redundancy)" \
@@ -2074,7 +2149,7 @@ run_hardening_scan() {
 
     # chrony tracking — are we actually synced?
     if command -v chronyc &>/dev/null; then
-        local tracking; tracking=$(timeout 5 chronyc tracking 2>/dev/null | grep "Leap status" | awk '{print $NF}')
+        local tracking; tracking=$(run_to 5 chronyc tracking 2>/dev/null | grep "Leap status" | awk '{print $NF}')
         if [[ "$tracking" == "Normal" ]]; then
             record_result "PASS" "HRDN-TIME-2" "chronyc reports time is synchronised (Leap status: Normal)" \
                 "AUDIT AND ACCOUNTABILITY" "System clock is synced to NTP." ""
@@ -2208,66 +2283,545 @@ run_hardening_scan() {
     log_ok "Built-in hardening scan complete."
 }
 
+# =============================================================================
+#   █████╗ ██╗██████╗      ██████╗  █████╗ ██████╗
+#  ██╔══██╗██║██╔══██╗    ██╔════╝ ██╔══██╗██╔══██╗
+#  ███████║██║██████╔╝    ██║  ███╗███████║██████╔╝
+#  ██╔══██║██║██╔══██╗    ██║   ██║██╔══██║██╔═══╝
+#  ██║  ██║██║██║  ██║    ╚██████╔╝██║  ██║██║
+#  ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝     ╚═════╝ ╚═╝  ╚═╝╚═╝
+#  AIR-GAP / ENCLAVE ISOLATION CHECKS
+#  Answers: "Could this host reach, bridge to, or leak into another network —
+#  and is it quietly decaying because it can't reach its update sources?"
+#  100% local reads: /proc, /sys, /etc, rpm DB. Nothing is resolved or probed.
+# =============================================================================
+
+# Hostname suffixes that are definitely outside an enclave. Extend as needed.
+AIRGAP_PUBLIC_PATTERNS="redhat.com fedoraproject.org centos.org rockylinux.org almalinux.org oracle.com amazonaws.com cloudfront.net github.com githubusercontent.com ntp.org google.com googleapis.com cloudflare.com windows.com microsoft.com apple.com nist.gov quad9.net opendns.com akamaized.net fastly.net"
+
+_is_ip_literal() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$1" == *:*:* ]]; }
+
+_is_private_ip() {
+    local ip="$1" o2
+    case "$ip" in
+        10.*|192.168.*|127.*|169.254.*|0.0.0.0|::1|::|[Ff][Ee]80:*|[Ff][CcDd]*:*) return 0 ;;
+        172.*) o2="${ip#172.}"; o2="${o2%%.*}"; [[ "$o2" =~ ^[0-9]+$ ]] && (( o2 >= 16 && o2 <= 31 )) && return 0 ;;
+        100.*) o2="${ip#100.}"; o2="${o2%%.*}"; [[ "$o2" =~ ^[0-9]+$ ]] && (( o2 >= 64 && o2 <= 127 )) && return 0 ;;
+    esac
+    return 1
+}
+
+# _host_is_public HOST → 0 if HOST is a public IP literal or a known internet domain
+_host_is_public() {
+    local h pat
+    h=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    h="${h#[}"; h="${h%]}"
+    [[ -z "$h" ]] && return 1
+    if _is_ip_literal "$h"; then
+        _is_private_ip "$h" && return 1
+        return 0
+    fi
+    for pat in $AIRGAP_PUBLIC_PATTERNS; do
+        [[ "$h" == "$pat" || "$h" == *".$pat" ]] && return 0
+    done
+    return 1
+}
+
+# _url_host URL → bare host (scheme, creds, port, path stripped)
+_url_host() {
+    local u="$1"
+    u="${u#*://}"; u="${u%%/*}"; u="${u##*@}"
+    if [[ "$u" == \[* ]]; then u="${u%%]*}"; u="${u#[}"; else u="${u%%:*}"; fi
+    printf '%s' "$u"
+}
+
+# _unit_on NAME → 0 if service/timer is enabled or active (systemd or SysV)
+_unit_on() {
+    local u="$1"
+    if command -v systemctl &>/dev/null; then
+        systemctl is-active  --quiet "$u" 2>/dev/null && return 0
+        [[ "$(systemctl is-enabled "$u" 2>/dev/null)" == "enabled" ]] && return 0
+        return 1
+    fi
+    [[ "$u" == *.timer || "$u" == *.path ]] && return 1
+    u="${u%.service}"
+    chkconfig --list "$u" 2>/dev/null | grep -q ':on' && return 0
+    return 1
+}
+
+_mod_loaded() { lsmod 2>/dev/null | awk '{print $1}' | grep -qx "$1"; }
+
+run_airgap_checks() {
+    banner "AIR-GAP — Network Egress & Bridging"
+
+    # AIR-NET-1: default route (IPv4 from /proc — works on RHEL 5–10, no `ip` needed)
+    local def4=0 def6=0
+    [[ -r /proc/net/route ]] && def4=$(awk 'NR>1 && $2=="00000000" && $8=="00000000"' /proc/net/route | wc -l)
+    [[ -r /proc/net/ipv6_route ]] && def6=$(awk '$1=="00000000000000000000000000000000" && $2=="00" && $10!="lo"' /proc/net/ipv6_route | wc -l)
+    if [[ $def4 -eq 0 && $def6 -eq 0 ]]; then
+        record_result "PASS" "AIR-NET-1" "No default route configured" \
+            "NETWORK CONFIGURATION" "Host has no default gateway (IPv4/IPv6) — traffic cannot leave the local segments by default." ""
+    else
+        local gw
+        gw=$(awk 'function hx(x,  i,n){n=0; x=toupper(x); for(i=1;i<=length(x);i++) n=n*16+index("0123456789ABCDEF",substr(x,i,1))-1; return n}
+                  NR>1 && $2=="00000000" {g=$3; printf "%d.%d.%d.%d (%s) ", hx(substr(g,7,2)), hx(substr(g,5,2)), hx(substr(g,3,2)), hx(substr(g,1,2)), $1}' /proc/net/route 2>/dev/null)
+        record_result "WARN" "AIR-NET-1" "Default route present (IPv4: $def4, IPv6: $def6)" \
+            "NETWORK CONFIGURATION" "Default gateway(s): ${gw:-see ip route}. In an isolated enclave confirm this gateway cannot forward beyond the enclave boundary." \
+            "Verify: ip route show default; remove if not required (nmcli con mod <con> ipv4.never-default yes)"
+    fi
+
+    # AIR-NET-2: multi-homed hosts can bridge enclaves
+    local ifaces
+    ifaces=$(ls /sys/class/net 2>/dev/null | grep -vE '^(lo|virbr[0-9]+-nic|docker[0-9]*|podman[0-9]*|cni.*|veth.*)$' | while read -r i; do
+        [[ "$(cat /sys/class/net/$i/operstate 2>/dev/null)" == "up" ]] && printf '%s ' "$i"; done)
+    local nif; nif=$(printf '%s' "$ifaces" | wc -w)
+    if [[ $nif -le 1 ]]; then
+        record_result "PASS" "AIR-NET-2" "Single active network interface (${ifaces% })" \
+            "NETWORK CONFIGURATION" "Host is not multi-homed." ""
+    else
+        record_result "WARN" "AIR-NET-2" "Host is multi-homed: $nif active interfaces (${ifaces% })" \
+            "NETWORK CONFIGURATION" "A host on several networks can bridge an enclave to another zone. Confirm each interface is intended and forwarding is off." \
+            "sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding  # both must be 0"
+    fi
+
+    # AIR-NET-3: IP forwarding (the bridge itself)
+    local f4 f6
+    f4=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
+    f6=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0)
+    if [[ "$f4" == "0" && "$f6" == "0" ]]; then
+        record_result "PASS" "AIR-NET-3" "IPv4 and IPv6 forwarding disabled" \
+            "NETWORK CONFIGURATION" "Host will not route packets between networks." ""
+    else
+        record_result "FAIL" "AIR-NET-3" "Packet forwarding enabled (ipv4=$f4, ipv6=$f6)" \
+            "NETWORK CONFIGURATION" "This host can act as a router between the enclave and other networks." \
+            "printf 'net.ipv4.ip_forward=0\nnet.ipv6.conf.all.forwarding=0\n' > /etc/sysctl.d/99-airgap.conf && sysctl --system"
+    fi
+
+    # AIR-DNS-1: resolvers outside the enclave
+    local ns pub_ns="" all_ns=""
+    for ns in $(awk '/^[[:space:]]*nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null); do
+        all_ns="$all_ns $ns"
+        _host_is_public "$ns" && pub_ns="$pub_ns $ns"
+    done
+    if [[ -n "$pub_ns" ]]; then
+        record_result "FAIL" "AIR-DNS-1" "Public DNS resolver(s) configured:${pub_ns}" \
+            "NETWORK CONFIGURATION" "Queries to public resolvers leak hostnames and are a classic DNS-tunnel exfiltration path." \
+            "Point /etc/resolv.conf (or NetworkManager ipv4.dns) at internal resolvers only"
+    elif [[ -z "$all_ns" ]]; then
+        record_result "INFO" "AIR-DNS-1" "No DNS resolvers configured" \
+            "NETWORK CONFIGURATION" "No nameserver entries in /etc/resolv.conf (common and acceptable in fully isolated hosts)." ""
+    else
+        record_result "PASS" "AIR-DNS-1" "Only internal DNS resolvers configured:${all_ns}" \
+            "NETWORK CONFIGURATION" "All nameservers are private addresses." ""
+    fi
+
+    # AIR-NET-4: proxies configured system-wide or for the package manager
+    local px
+    px=$(grep -hiE '^[[:space:]]*(export[[:space:]]+)?(https?|ftp|all)_proxy[[:space:]]*=|^[[:space:]]*proxy[[:space:]]*=' \
+        /etc/environment /etc/profile /etc/profile.d/*.sh /etc/yum.conf /etc/dnf/dnf.conf /etc/yum.repos.d/*.repo 2>/dev/null \
+        | sed 's/[[:space:]]\+/ /g; s/\(:\/\/\)[^@/]*@/\1***@/' | sort -u | head -5 | tr '\n' ';')
+    if [[ -z "$px" ]]; then
+        record_result "PASS" "AIR-NET-4" "No system-wide or package-manager proxy configured" \
+            "NETWORK CONFIGURATION" "No *_proxy / proxy= settings found." ""
+    else
+        record_result "WARN" "AIR-NET-4" "Proxy configuration present" \
+            "NETWORK CONFIGURATION" "Proxy settings found (credentials masked): ${px}. Confirm the proxy is an internal, enclave-scoped service." \
+            "Review /etc/environment, /etc/profile.d/, /etc/yum.conf, /etc/dnf/dnf.conf"
+    fi
+
+    banner "AIR-GAP — Radios & Covert Channels"
+
+    # AIR-RF-1: Wi-Fi hardware/driver
+    local wifi_if="" m wifi_mods=""
+    for i in /sys/class/net/*; do
+        [[ -d "$i/wireless" || -e "$i/phy80211" ]] && wifi_if="$wifi_if ${i##*/}"
+    done
+    for m in iwlwifi iwlmvm iwldvm ath9k ath10k_pci ath11k_pci ath12k brcmfmac b43 rt2800pci rt2800usb rtw88_pci rtw89_pci mt7921e mt76 cfg80211 mac80211; do
+        _mod_loaded "$m" && wifi_mods="$wifi_mods $m"
+    done
+    if [[ -z "$wifi_if" && -z "$wifi_mods" ]]; then
+        record_result "PASS" "AIR-RF-1" "No Wi-Fi interfaces or drivers loaded" \
+            "MEDIA PROTECTION" "No 802.11 interfaces and no wireless stack modules loaded." ""
+    else
+        record_result "FAIL" "AIR-RF-1" "Wi-Fi capability present" \
+            "MEDIA PROTECTION" "Interfaces:${wifi_if:- none}; modules:${wifi_mods:- none}. A radio defeats the air gap." \
+            "nmcli radio wifi off; blacklist drivers in /etc/modprobe.d/airgap.conf (install <mod> /bin/false); remove hardware where possible"
+    fi
+
+    # AIR-RF-2: Bluetooth
+    local bt_mods=""
+    for m in bluetooth btusb btintel btrtl hci_uart; do _mod_loaded "$m" && bt_mods="$bt_mods $m"; done
+    if [[ -z "$bt_mods" ]] && ! ls /sys/class/bluetooth/* &>/dev/null; then
+        record_result "PASS" "AIR-RF-2" "No Bluetooth stack loaded" \
+            "MEDIA PROTECTION" "No Bluetooth modules or controllers present." ""
+    else
+        record_result "FAIL" "AIR-RF-2" "Bluetooth stack loaded:${bt_mods:- (controller present)}" \
+            "MEDIA PROTECTION" "Bluetooth provides an out-of-band radio channel across the air gap." \
+            "systemctl mask --now bluetooth; echo 'install bluetooth /bin/false' >> /etc/modprobe.d/airgap.conf"
+    fi
+
+    # AIR-RF-3: cellular / WWAN modems
+    local wwan=""
+    for m in qmi_wwan cdc_mbim cdc_wdm option sierra sierra_net mhi_wwan_ctrl wwan; do _mod_loaded "$m" && wwan="$wwan $m"; done
+    ls /dev/cdc-wdm* /dev/wwan* &>/dev/null && wwan="$wwan (device nodes present)"
+    _unit_on ModemManager.service && wwan="$wwan ModemManager"
+    if [[ -z "$wwan" ]]; then
+        record_result "PASS" "AIR-RF-3" "No cellular/WWAN modem capability" \
+            "MEDIA PROTECTION" "No WWAN drivers, device nodes or ModemManager." ""
+    else
+        record_result "FAIL" "AIR-RF-3" "Cellular/WWAN capability present:$wwan" \
+            "MEDIA PROTECTION" "A cellular modem is a direct, unmonitored path to the internet." \
+            "systemctl mask --now ModemManager; blacklist WWAN drivers; physically remove the modem"
+    fi
+
+    # AIR-RF-4: USB network adapters / phone tethering
+    local usbnet=""
+    for m in cdc_ether cdc_ncm rndis_host r8152 ax88179_178a asix usbnet ipheth; do _mod_loaded "$m" && usbnet="$usbnet $m"; done
+    if [[ -z "$usbnet" ]]; then
+        record_result "PASS" "AIR-RF-4" "No USB network / tethering drivers loaded" \
+            "MEDIA PROTECTION" "Plugging in a phone or USB NIC has not created a network path." ""
+    else
+        record_result "WARN" "AIR-RF-4" "USB network/tethering drivers loaded:$usbnet" \
+            "MEDIA PROTECTION" "A tethered phone or USB NIC can silently add an internet uplink." \
+            "Blacklist: for m in cdc_ether rndis_host ipheth r8152; do echo \"install \$m /bin/false\"; done >> /etc/modprobe.d/airgap.conf; enforce USBGuard"
+    fi
+
+    # AIR-DMA-1: Thunderbolt / FireWire DMA
+    local dma="" sec
+    for d in /sys/bus/thunderbolt/devices/domain*/security; do
+        [[ -r "$d" ]] || continue
+        sec=$(cat "$d" 2>/dev/null)
+        [[ "$sec" == "none" || "$sec" == "dponly" ]] || continue
+        dma="$dma thunderbolt(security=$sec)"
+    done
+    for m in firewire_ohci ohci1394; do _mod_loaded "$m" && dma="$dma $m"; done
+    if [[ -z "$dma" ]]; then
+        record_result "PASS" "AIR-DMA-1" "No unauthenticated DMA ports (Thunderbolt/FireWire)" \
+            "MEDIA PROTECTION" "No FireWire drivers loaded and Thunderbolt (if any) requires authorization." ""
+    else
+        record_result "WARN" "AIR-DMA-1" "DMA-capable port exposure:$dma" \
+            "MEDIA PROTECTION" "Physical DMA attacks can read memory or inject code without any network." \
+            "Set Thunderbolt security to 'user'/'secure' in firmware; blacklist firewire_ohci; enable IOMMU (intel_iommu=on / amd_iommu=on)"
+    fi
+
+    # AIR-USB-1: desktop automount of removable media
+    if _unit_on udisks2.service; then
+        record_result "WARN" "AIR-USB-1" "udisks2 is running (removable media automount)" \
+            "MEDIA PROTECTION" "Removable media can be mounted by users — the main malware/exfil path into an air-gapped network." \
+            "systemctl mask --now udisks2   # and enforce USBGuard allow-list"
+    else
+        record_result "PASS" "AIR-USB-1" "udisks2 automount not active" \
+            "MEDIA PROTECTION" "Removable media is not auto-mounted for users." ""
+    fi
+
+    banner "AIR-GAP — Phone-Home & Discovery Services"
+
+    # AIR-SVC-n: services that try to reach the internet or advertise on the LAN
+    local entry unit why found=0 k=0
+    local svc_list=(
+        "rhsmcertd.service|Red Hat subscription cert checks — contacts RHSM/Satellite"
+        "insights-client.timer|Red Hat Insights uploads system data"
+        "rhcd.service|Remote host configuration daemon (console.redhat.com)"
+        "dnf-makecache.timer|Periodic repo metadata refresh — fails noisily or reaches outside"
+        "dnf-automatic.timer|Automatic updates — unreviewed change in a controlled enclave"
+        "dnf-automatic-install.timer|Automatic updates install without change control"
+        "yum-cron.service|Automatic updates (RHEL 7)"
+        "packagekit.service|PackageKit background refresh"
+        "avahi-daemon.service|mDNS/DNS-SD advertises host and services on the LAN"
+        "cups-browsed.service|Printer discovery — network listener (CVE-2024-47176 class)"
+        "cloud-init.service|Fetches instance metadata/user-data at boot"
+        "geoclue.service|Geolocation service (Wi-Fi/network lookups)"
+        "kdump.service|__KDUMP__"
+    )
+    for entry in "${svc_list[@]}"; do
+        unit="${entry%%|*}"; why="${entry#*|}"
+        if [[ "$why" == "__KDUMP__" ]]; then
+            # kdump is fine locally; only flag when it ships dumps over the network
+            _unit_on "$unit" || continue
+            grep -qE '^[[:space:]]*(ssh|nfs|net)[[:space:]]' /etc/kdump.conf 2>/dev/null || continue
+            why="kdump sends crash dumps (full memory) over the network"
+        else
+            _unit_on "$unit" || continue
+        fi
+        found=$(( found + 1 )); k=$(( k + 1 ))
+        record_result "WARN" "AIR-SVC-${unit%%.*}" "$unit is enabled/active" \
+            "CONFIGURATION MANAGEMENT" "$why." \
+            "systemctl disable --now $unit   # or mask, if not required in the enclave"
+    done
+    if [[ $found -eq 0 ]]; then
+        record_result "PASS" "AIR-SVC-0" "No phone-home or LAN discovery services active" \
+            "CONFIGURATION MANAGEMENT" "None of the known call-home/discovery services are enabled." ""
+    fi
+
+    # AIR-RHSM-1: subscription-manager pointed at the public CDN
+    if [[ -r /etc/rhsm/rhsm.conf ]]; then
+        local rhsm_host; rhsm_host=$(awk -F'=' '/^\[server\]/{s=1;next} /^\[/{s=0} s && $1~/^[[:space:]]*hostname[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' /etc/rhsm/rhsm.conf)
+        if [[ -n "$rhsm_host" ]] && _host_is_public "$rhsm_host"; then
+            record_result "WARN" "AIR-RHSM-1" "subscription-manager targets public host: $rhsm_host" \
+                "CONFIGURATION MANAGEMENT" "Disconnected hosts should register to an internal Satellite or use offline manifests." \
+                "subscription-manager config --server.hostname=<internal-satellite>  OR  disable rhsmcertd"
+        else
+            record_result "PASS" "AIR-RHSM-1" "subscription-manager server is internal (${rhsm_host:-unset})" \
+                "CONFIGURATION MANAGEMENT" "RHSM is not configured to reach the public Red Hat CDN." ""
+        fi
+    fi
+
+    banner "AIR-GAP — Update Sources & Patch Currency"
+
+    # AIR-REPO-1: enabled repositories that point at the internet
+    local repo_report
+    repo_report=$(awk '
+        FNR==1 { sec="" }
+        /^[[:space:]]*\[/ { flush(); sec=$0; gsub(/[][[:space:]]/,"",sec); en=1; urls=""; next }
+        /^[[:space:]]*enabled[[:space:]]*=/ { v=$0; sub(/.*=[[:space:]]*/,"",v); en=(v=="1"||v=="true"||v=="yes") }
+        /^[[:space:]]*(baseurl|mirrorlist|metalink)[[:space:]]*=/ { k=$0; sub(/[[:space:]]*=.*/,"",k); gsub(/[[:space:]]/,"",k)
+            v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); urls=urls " " k "=" v }
+        function flush() { if (sec!="" && en && urls!="") print sec "\t" urls; sec="" }
+        END { flush() }' /etc/yum.repos.d/*.repo 2>/dev/null)
+    local pub_repos="" line rname rurls u h
+    while IFS=$'\t' read -r rname rurls; do
+        [[ -z "$rname" ]] && continue
+        for u in $rurls; do
+            local key="${u%%=*}" val="${u#*=}"
+            h=$(_url_host "$val")
+            if [[ "$key" == "mirrorlist" || "$key" == "metalink" ]] || _host_is_public "$h"; then
+                pub_repos="$pub_repos $rname(${h:-$key})"; break
+            fi
+        done
+    done <<< "$repo_report"
+    if [[ -z "$repo_report" ]]; then
+        record_result "INFO" "AIR-REPO-1" "No enabled yum/dnf repositories" \
+            "SYSTEM INTEGRITY" "No enabled repos with a baseurl/mirrorlist in /etc/yum.repos.d/." ""
+    elif [[ -z "$pub_repos" ]]; then
+        record_result "PASS" "AIR-REPO-1" "All enabled repositories are internal or local media" \
+            "SYSTEM INTEGRITY" "No enabled repo references a public mirror, mirrorlist or metalink." ""
+    else
+        record_result "WARN" "AIR-REPO-1" "Enabled repositories point outside the enclave" \
+            "SYSTEM INTEGRITY" "Repos:${pub_repos}. These cannot be reached and cause timeouts; some tools may try to fall back to other sources." \
+            "dnf config-manager --set-disabled <repo>  and use an internal mirror (baseurl=https://mirror.internal/...) or file:///mnt/media"
+    fi
+
+    # AIR-PATCH-1: patch age — the real risk of a disconnected host
+    local newest now age_days
+    newest=$(rpm -qa --qf '%{INSTALLTIME}\n' 2>/dev/null | sort -n | tail -1)
+    now=$(date +%s)
+    if [[ "$newest" =~ ^[0-9]+$ ]]; then
+        age_days=$(( (now - newest) / 86400 ))
+        local last_pkg; last_pkg=$(rpm -qa --last 2>/dev/null | head -1 | awk '{print $1}')
+        if [[ $age_days -le $MAX_PATCH_AGE ]]; then
+            record_result "PASS" "AIR-PATCH-1" "Last package change ${age_days} day(s) ago" \
+                "SYSTEM INTEGRITY" "Most recent install/update: ${last_pkg}. Threshold: ${MAX_PATCH_AGE} days." ""
+        elif [[ $age_days -le $(( MAX_PATCH_AGE * 2 )) ]]; then
+            record_result "WARN" "AIR-PATCH-1" "No package updates for ${age_days} days (threshold ${MAX_PATCH_AGE})" \
+                "SYSTEM INTEGRITY" "Most recent change: ${last_pkg}. Air-gapped hosts silently fall behind on security errata." \
+                "Import the latest errata via your internal mirror/transfer media, then patch"
+        else
+            record_result "FAIL" "AIR-PATCH-1" "No package updates for ${age_days} days (>2x ${MAX_PATCH_AGE}-day threshold)" \
+                "SYSTEM INTEGRITY" "Most recent change: ${last_pkg}. The host is likely missing multiple critical errata." \
+                "Schedule an offline patch cycle: sync mirror -> transfer -> dnf update"
+        fi
+    else
+        record_result "SKIP" "AIR-PATCH-1" "Could not read package install times" "SYSTEM INTEGRITY" "rpm query failed." ""
+    fi
+
+    # AIR-PATCH-2: running kernel older than newest installed kernel
+    local run_k newest_k
+    run_k=$(uname -r)
+    newest_k=$(rpm -q --last kernel kernel-core kernel-uek 2>/dev/null | grep -v 'not installed' | head -1 | awk '{print $1}' | sed -r 's/^kernel(-core|-uek)?-//')
+    if [[ -z "$newest_k" ]]; then
+        record_result "SKIP" "AIR-PATCH-2" "Could not determine installed kernels" "SYSTEM INTEGRITY" "No kernel package found in rpm DB." ""
+    elif [[ "$run_k" == "$newest_k" ]]; then
+        record_result "PASS" "AIR-PATCH-2" "Running the newest installed kernel ($run_k)" \
+            "SYSTEM INTEGRITY" "No reboot is pending to activate kernel fixes." ""
+    else
+        record_result "WARN" "AIR-PATCH-2" "Reboot pending: running $run_k, newest installed $newest_k" \
+            "SYSTEM INTEGRITY" "Kernel security fixes that were imported are not active until reboot." \
+            "Schedule a reboot in the next maintenance window"
+    fi
+
+    banner "AIR-GAP — Time, Logging & Tunnels"
+
+    # AIR-TIME-1: time sources that cannot be reached from an enclave
+    local tconf srcs="" pub_t=""
+    for tconf in /etc/chrony.conf /etc/chrony.d/*.conf /etc/ntp.conf; do
+        [[ -r "$tconf" ]] || continue
+        srcs="$srcs $(awk '/^[[:space:]]*(server|pool|peer)[[:space:]]/ {print $2}' "$tconf")"
+    done
+    for h in $srcs; do _host_is_public "$h" && pub_t="$pub_t $h"; done
+    if [[ -z "${srcs// /}" ]]; then
+        record_result "WARN" "AIR-TIME-1" "No NTP time sources configured" \
+            "AUDIT AND ACCOUNTABILITY" "Without a shared internal time source, log correlation and Kerberos break across the enclave." \
+            "Configure an internal stratum source (GPS/PTP appliance or an enclave NTP server) in /etc/chrony.conf"
+    elif [[ -n "$pub_t" ]]; then
+        record_result "WARN" "AIR-TIME-1" "Public/unreachable NTP sources configured:$pub_t" \
+            "AUDIT AND ACCOUNTABILITY" "Public time pools are unreachable in an enclave; the clock will drift." \
+            "Replace with internal time sources in /etc/chrony.conf"
+    else
+        record_result "PASS" "AIR-TIME-1" "Time sources are internal:$srcs" \
+            "AUDIT AND ACCOUNTABILITY" "No public NTP pools referenced." ""
+    fi
+
+    # AIR-LOG-1: remote log forwarding to public destinations
+    local tgt pub_log="" any_log=""
+    for tgt in $(grep -hvE '^[[:space:]]*#' /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null \
+                 | grep -oE '(^|[[:space:]])@@?(\([^)]*\))?[^[:space:]:;]+|target="[^"]+"' \
+                 | sed -r 's/^[[:space:]]*//; s/^@@?(\([^)]*\))?//; s/^target="//; s/"$//'); do
+        [[ -z "$tgt" ]] && continue
+        any_log="$any_log $tgt"
+        _host_is_public "$tgt" && pub_log="$pub_log $tgt"
+    done
+    if [[ -n "$pub_log" ]]; then
+        record_result "FAIL" "AIR-LOG-1" "Logs forwarded to public destination(s):$pub_log" \
+            "AUDIT AND ACCOUNTABILITY" "Log forwarding outside the enclave is both an exfiltration channel and unreachable." \
+            "Forward to an internal collector only (rsyslog action target=)"
+    else
+        record_result "INFO" "AIR-LOG-1" "Remote log destinations:${any_log:- none}" \
+            "AUDIT AND ACCOUNTABILITY" "No public log destinations. Local-only logging needs a documented offline collection process." ""
+    fi
+
+    # AIR-SSH-1: SSH tunnelling features that can bridge enclaves
+    if command -v sshd &>/dev/null || [[ -r /etc/ssh/sshd_config ]]; then
+        local sshcfg on_feats="" fk fv
+        sshcfg=$(sshd -T 2>/dev/null)
+        if [[ -z "$sshcfg" ]]; then
+            # fallback: parse config files (first match wins, like sshd) with OpenSSH defaults
+            sshcfg=$(cat /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config 2>/dev/null | awk '
+                /^[[:space:]]*[Mm]atch/ {exit} /^[[:space:]]*#/ {next} NF>=2 {k=tolower($1); if(!(k in s)) s[k]=tolower($2)}
+                END { d["allowtcpforwarding"]="yes"; d["permittunnel"]="no"; d["gatewayports"]="no";
+                      d["x11forwarding"]="no"; d["allowagentforwarding"]="yes"; d["allowstreamlocalforwarding"]="yes"
+                      for (k in d) print k, (k in s ? s[k] : d[k]) }')
+        fi
+        for fk in allowtcpforwarding permittunnel gatewayports x11forwarding allowagentforwarding allowstreamlocalforwarding; do
+            fv=$(printf '%s\n' "$sshcfg" | awk -v k="$fk" 'tolower($1)==k {print tolower($2); exit}')
+            [[ -n "$fv" && "$fv" != "no" ]] && on_feats="$on_feats $fk=$fv"
+        done
+        if [[ -z "$on_feats" ]]; then
+            record_result "PASS" "AIR-SSH-1" "SSH forwarding/tunnelling disabled" \
+                "ACCESS CONTROL" "TCP/agent/stream/X11 forwarding, tunnels and gateway ports are off." ""
+        else
+            record_result "WARN" "AIR-SSH-1" "SSH forwarding/tunnelling enabled:$on_feats" \
+                "ACCESS CONTROL" "SSH port forwarding and tunnels let a single allowed SSH session pivot traffic across enclave boundaries." \
+                "In sshd_config: AllowTcpForwarding no, AllowAgentForwarding no, AllowStreamLocalForwarding no, PermitTunnel no, GatewayPorts no, X11Forwarding no"
+        fi
+    fi
+
+    log_ok "Air-gap isolation checks complete."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCORING — PASS / (PASS + FAIL + WARN)
+# INFO, SKIP and WAIVED are excluded. Previously SKIP/INFO counted against the
+# score, so a non-root scan looked far worse than the host really was.
+# ─────────────────────────────────────────────────────────────────────────────
+compliance_pct() {
+    local denom=$(( PASS + FAIL + WARN ))
+    awk -v p="$PASS" -v d="$denom" 'BEGIN{ if (d>0) printf "%.1f", (p/d)*100; else print "0.0" }'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DRIFT vs BASELINE — pure awk over RHELGuard's own one-result-per-line JSON
+# ─────────────────────────────────────────────────────────────────────────────
+compute_drift() {
+    [[ -z "$BASELINE_FILE" ]] && return 0
+    awk '
+        function field(line,k,   m){ if (match(line, "\"" k "\":\"[^\"]*\"")) { m=substr(line,RSTART,RLENGTH); sub("^\"" k "\":\"","",m); sub("\"$","",m); return m } return "" }
+        FNR==NR { if ($0 ~ /"change":/) next; id=field($0,"id"); if (id!="") old[id]=field($0,"status"); next }
+        { id=field($0,"id"); if (id=="") next; st=field($0,"status"); t=field($0,"title")
+          if (!(id in old)) { if (st=="FAIL"||st=="WARN") print "NEW\t" id "\t-\t" st "\t" t; next }
+          o=old[id]
+          if (o!=st) {
+            if ((st=="FAIL"||st=="WARN") && o!="FAIL" && o!="WARN") k="REGRESSED"
+            else if (st=="PASS" && (o=="FAIL"||o=="WARN")) k="FIXED"
+            else k="CHANGED"
+            print k "\t" id "\t" o "\t" st "\t" t
+          } }' "$BASELINE_FILE" "$RESULTS_FILE" > "$DRIFT_FILE"
+    DRIFT_NEW_FAIL=$(grep -cE '^(NEW|REGRESSED)' "$DRIFT_FILE" || true)
+    DRIFT_FIXED=$(grep -c '^FIXED' "$DRIFT_FILE" || true)
+    DRIFT_CHANGED=$(grep -c . "$DRIFT_FILE" || true)
+}
+
+_jstr() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
+_h()    { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REPORT GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 generate_json_report() {
     local jfile="$OUTPUT_DIR/${TOOL_NAME}_${HOSTNAME_VAL}_${REPORT_TS}.json"
     local elapsed=$(( $(date +%s) - START_TS ))
-    local cpct; cpct=$(awk "BEGIN{printf \"%.1f\", ($PASS/$TOTAL)*100}" 2>/dev/null || echo "0")
+    local cpct; cpct=$(compliance_pct)
 
     {
         printf '{\n'
-        printf '  "tool": "%s",\n'          "$TOOL_NAME"
-        printf '  "version": "%s",\n'       "$TOOL_VERSION"
-        printf '  "hostname": "%s",\n'      "$HOSTNAME_VAL"
-        printf '  "scan_date": "%s",\n'     "$(date -Iseconds)"
-        printf '  "os": "%s",\n'            "$RHEL_FULL"
-        printf '  "rhel_major": %d,\n'      "$RHEL_MAJOR"
-        printf '  "os_family": "%s",\n'     "$OS_FAMILY"
-        printf '  "kernel": "%s",\n'        "$(uname -r)"
-        printf '  "scan_mode": "%s",\n'     "$SCAN_MODE"
-        printf '  "run_as_root": %s,\n'     "$IS_ROOT"
+        printf '  "tool": "%s",\n'           "$TOOL_NAME"
+        printf '  "version": "%s",\n'        "$TOOL_VERSION"
+        printf '  "script_sha256": "%s",\n'  "$(_jstr "$SCRIPT_SHA256")"
+        printf '  "hostname": "%s",\n'       "$(_jstr "$HOSTNAME_VAL")"
+        printf '  "scan_date": "%s",\n'      "$(date -Iseconds 2>/dev/null || date)"
+        printf '  "os": "%s",\n'             "$(_jstr "$RHEL_FULL")"
+        printf '  "rhel_major": %d,\n'       "$RHEL_MAJOR"
+        printf '  "os_family": "%s",\n'      "$OS_FAMILY"
+        printf '  "kernel": "%s",\n'         "$(_jstr "$(uname -r)")"
+        printf '  "scan_mode": "%s",\n'      "$(_jstr "$SCAN_MODE")"
+        printf '  "run_as_root": %s,\n'      "$IS_ROOT"
         printf '  "duration_seconds": %d,\n' "$elapsed"
+        printf '  "baseline": "%s",\n'       "$(_jstr "${BASELINE_FILE##*/}")"
+        printf '  "waiver_file": "%s",\n'    "$(_jstr "${WAIVER_FILE##*/}")"
         printf '  "summary": {\n'
-        printf '    "total": %d,\n'         "$TOTAL"
-        printf '    "pass": %d,\n'          "$PASS"
-        printf '    "fail": %d,\n'          "$FAIL"
-        printf '    "warn": %d,\n'          "$WARN"
-        printf '    "info": %d,\n'          "$INFO"
-        printf '    "skip": %d,\n'          "$SKIP"
-        printf '    "priv_skip": %d,\n'     "$PRIV_SKIP"
-        printf '    "compliance_pct": %s\n' "$cpct"
+        printf '    "total": %d,\n'          "$TOTAL"
+        printf '    "pass": %d,\n'           "$PASS"
+        printf '    "fail": %d,\n'           "$FAIL"
+        printf '    "warn": %d,\n'           "$WARN"
+        printf '    "info": %d,\n'           "$INFO"
+        printf '    "skip": %d,\n'           "$SKIP"
+        printf '    "waived": %d,\n'         "$WAIVED"
+        printf '    "priv_skip": %d,\n'      "$PRIV_SKIP"
+        printf '    "compliance_pct": %s,\n' "$cpct"
+        printf '    "compliance_formula": "pass/(pass+fail+warn)",\n'
+        printf '    "drift_new_or_regressed": %d,\n' "$DRIFT_NEW_FAIL"
+        printf '    "drift_fixed": %d\n'     "$DRIFT_FIXED"
         printf '  },\n'
+        printf '  "drift": [\n'
+        awk -F'\t' '{ for(i=1;i<=5;i++){ gsub(/\\/,"\\\\",$i); gsub(/"/,"\\\"",$i) }
+                      printf "%s{\"change\":\"%s\",\"id\":\"%s\",\"from\":\"%s\",\"to\":\"%s\",\"title\":\"%s\"}\n", (NR>1?"   ,":"    "), $1,$2,$3,$4,$5 }' "$DRIFT_FILE"
+        printf '  ],\n'
         printf '  "results": [\n'
-        local first=true
-        while IFS= read -r line; do
-            [[ "$first" == true ]] && printf '    %s\n' "$line" || printf '   ,%s\n' "$line"
-            first=false
-        done < "$RESULTS_FILE"
+        # one result per line is intentional: grep/awk/baseline friendly
+        awk '{ printf "%s%s\n", (NR>1 ? "   ," : "    "), $0 }' "$RESULTS_FILE"
         printf '  ]\n}\n'
     } > "$jfile"
-
     echo "$jfile"
+}
+
+generate_csv_report() {
+    local cfile="$OUTPUT_DIR/${TOOL_NAME}_${HOSTNAME_VAL}_${REPORT_TS}.csv"
+    { echo '"id","status","category","title","description","remediation"'; cat "$CSV_ROWS_FILE"; } > "$cfile"
+    echo "$cfile"
 }
 
 generate_html_report() {
     local hfile="$OUTPUT_DIR/${TOOL_NAME}_${HOSTNAME_VAL}_${REPORT_TS}.html"
-    local cpct; cpct=$(awk "BEGIN{if($TOTAL>0) printf \"%.1f\", ($PASS/$TOTAL)*100; else print 0}" 2>/dev/null || echo "0")
+    local cpct; cpct=$(compliance_pct)
     local elapsed=$(( $(date +%s) - START_TS ))
+    local h_host h_os h_kernel h_mode h_sha
+    h_host=$(_h "$HOSTNAME_VAL"); h_os=$(_h "$RHEL_FULL"); h_kernel=$(_h "$(uname -r)")
+    h_mode=$(_h "$SCAN_MODE");    h_sha=$(_h "$SCRIPT_SHA256")
 
     local score_color="#e74c3c"
-    local _cpct_int; _cpct_int=$(echo "$cpct" | awk "{printf \"%d\", \$1}")
+    local _cpct_int="${cpct%%.*}"
     [[ "$_cpct_int" -ge 80 ]] && score_color="#27ae60"
-    [[ "$_cpct_int" -ge 60 ]] && [[ "$_cpct_int" -lt 80 ]] && score_color="#f39c12"
+    [[ "$_cpct_int" -ge 60 && "$_cpct_int" -lt 80 ]] && score_color="#f39c12"
 
-    cat > "$hfile" << HTMLEOF
+    {
+    cat << 'CSSEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>RHELGuard — ${HOSTNAME_VAL} — ${REPORT_TS}</title>
+<!-- Air-gap safe: the report can never load or send anything over the network -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
 <style>
 :root{--pass:#27ae60;--fail:#e74c3c;--warn:#f39c12;--info:#3498db;--skip:#7f8c8d;
   --bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--accent:#1f6feb;--head:#21262d}
@@ -2284,8 +2838,8 @@ a{color:var(--accent);text-decoration:none}
 .score-row{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
 .score-card{background:var(--head);border:1px solid var(--border);border-radius:12px;
   padding:20px 28px;display:flex;align-items:center;gap:20px;flex:1;min-width:260px}
-.score-circle{width:80px;height:80px;border-radius:50%;border:5px solid ${score_color};
-  display:flex;align-items:center;justify-content:center;font-size:1.3rem;font-weight:700;color:${score_color};flex-shrink:0}
+.score-circle{width:80px;height:80px;border-radius:50%;border:5px solid #e74c3c;
+  display:flex;align-items:center;justify-content:center;font-size:1.3rem;font-weight:700;color:#e74c3c;flex-shrink:0}
 .score-detail h2{font-size:1rem;font-weight:600;color:var(--text)}
 .score-detail p{font-size:.8rem;color:#8b949e;margin-top:4px}
 /* ── Summary Cards ── */
@@ -2324,56 +2878,87 @@ tr:hover td{background:rgba(255,255,255,.02)}
 /* ── Progress bar ── */
 .prog-bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-bottom:20px}
 .prog-fill{height:100%;background:linear-gradient(90deg,var(--fail) 0%,var(--warn) 50%,var(--pass) 100%);
-  width:${cpct}%;transition:width 1s ease}
+  transition:width 1s ease}
 /* ── Priv warning ── */
 .priv-warn{background:rgba(243,156,18,.12);border:1px solid var(--warn);border-radius:8px;
   padding:12px 16px;margin-bottom:20px;font-size:.85rem;color:var(--warn)}
 footer{margin-top:30px;font-size:.72rem;color:#484f58;text-align:center;padding:10px}
+.b-WAIVED{background:#8e44ad;color:#fff}.fb-WAIVED{background:#8e44ad;color:#fff}
+.desc{color:#8b949e}
+.drift{background:var(--head);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-bottom:20px}
+.drift h3{font-size:.9rem;margin-bottom:8px}
+.drift td{padding:5px 10px}
+.d-REGRESSED,.d-NEW{color:var(--fail);font-weight:700}.d-FIXED{color:var(--pass);font-weight:700}.d-CHANGED{color:var(--warn)}
+.sha{font-family:monospace;font-size:.72rem;color:#8b949e;word-break:break-all}
+@media print{body{background:#fff;color:#000}.controls{display:none}}
 </style>
+CSSEOF
+    cat << HTMLEOF
+<title>RHELGuard — ${h_host} — ${REPORT_TS}</title>
 </head>
 <body>
 
 <div class="header">
   <div class="logo">RHELGuard</div>
   <div class="header-meta">
-    <div>🖥️ <strong>${HOSTNAME_VAL}</strong> &nbsp;|&nbsp; 📅 <strong>$(date '+%Y-%m-%d %H:%M:%S %Z')</strong></div>
-    <div>🐧 <strong>${RHEL_FULL}</strong> &nbsp;|&nbsp; 🔧 Kernel <strong>$(uname -r)</strong></div>
-    <div>⚙️ Mode: <strong>${SCAN_MODE}</strong> &nbsp;|&nbsp; 🔑 Root: <strong>${IS_ROOT}</strong> &nbsp;|&nbsp; ⏱ ${elapsed}s</div>
+    <div>🖥️ <strong>${h_host}</strong> &nbsp;|&nbsp; 📅 <strong>$(date '+%Y-%m-%d %H:%M:%S %Z')</strong></div>
+    <div>🐧 <strong>${h_os}</strong> &nbsp;|&nbsp; 🔧 Kernel <strong>${h_kernel}</strong></div>
+    <div>⚙️ Mode: <strong>${h_mode}</strong> &nbsp;|&nbsp; 🔑 Root: <strong>${IS_ROOT}</strong> &nbsp;|&nbsp; ⏱ ${elapsed}s &nbsp;|&nbsp; v${TOOL_VERSION}</div>
+    <div class="sha">script sha256: ${h_sha}</div>
   </div>
 </div>
+HTMLEOF
 
-$(if [[ "$IS_ROOT" == false ]]; then
-echo '<div class="priv-warn">⚠️ &nbsp;<strong>Non-root scan</strong> — '"$PRIV_SKIP"' privileged checks were skipped. Re-run with <code>sudo ./rhelguard.sh</code> for full coverage.</div>'
-fi)
+    if [[ "$IS_ROOT" == false ]]; then
+        echo "<div class=\"priv-warn\">⚠️ &nbsp;<strong>Non-root scan</strong> — ${PRIV_SKIP} privileged checks were skipped. Re-run with <code>sudo ./rhelguard.sh</code> for full coverage.</div>"
+    fi
 
+    cat << HTMLEOF
 <div class="score-row">
   <div class="score-card">
-    <div class="score-circle">${cpct}%</div>
+    <div class="score-circle" style="border-color:${score_color};color:${score_color}">${cpct}%</div>
     <div class="score-detail">
       <h2>Compliance Score</h2>
-      <p>${PASS} passed · ${FAIL} failed · ${WARN} warnings · ${SKIP} skipped</p>
-      <p style="margin-top:8px;color:#8b949e">Out of ${TOTAL} total checks</p>
+      <p>${PASS} passed · ${FAIL} failed · ${WARN} warnings · ${WAIVED} waived · ${SKIP} skipped</p>
+      <p style="margin-top:8px;color:#8b949e">Score = pass ÷ (pass + fail + warn) · ${TOTAL} checks total</p>
     </div>
   </div>
 </div>
 
-<div class="prog-bar"><div class="prog-fill"></div></div>
+<div class="prog-bar"><div class="prog-fill" style="width:${cpct}%"></div></div>
 
 <div class="cards">
   <div class="card"><div class="num" style="color:var(--pass)">${PASS}</div><div class="lbl">Pass</div></div>
   <div class="card"><div class="num" style="color:var(--fail)">${FAIL}</div><div class="lbl">Fail</div></div>
   <div class="card"><div class="num" style="color:var(--warn)">${WARN}</div><div class="lbl">Warn</div></div>
+  <div class="card"><div class="num" style="color:#8e44ad">${WAIVED}</div><div class="lbl">Waived</div></div>
   <div class="card"><div class="num" style="color:var(--info)">${INFO}</div><div class="lbl">Info</div></div>
   <div class="card"><div class="num" style="color:var(--skip)">${SKIP}</div><div class="lbl">Skip</div></div>
   <div class="card"><div class="num">${TOTAL}</div><div class="lbl">Total</div></div>
 </div>
+HTMLEOF
 
+    if [[ -n "$BASELINE_FILE" ]]; then
+        echo "<div class=\"drift\"><h3>📈 Drift since baseline <code>$(_h "${BASELINE_FILE##*/}")</code> — ${DRIFT_NEW_FAIL} new/regressed · ${DRIFT_FIXED} fixed · ${DRIFT_CHANGED} changed</h3>"
+        if [[ -s "$DRIFT_FILE" ]]; then
+            echo "<table><thead><tr><th>Change</th><th>Check ID</th><th>From</th><th>To</th><th>Title</th></tr></thead><tbody>"
+            awk -F'\t' 'function h(x){gsub(/&/,"\\&amp;",x);gsub(/</,"\\&lt;",x);gsub(/>/,"\\&gt;",x);return x}
+                { printf "<tr><td class=\"d-%s\">%s</td><td class=\"id-cell\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n", h($1),h($1),h($2),h($3),h($4),h($5) }' "$DRIFT_FILE"
+            echo "</tbody></table>"
+        else
+            echo "<p>No changes.</p>"
+        fi
+        echo "</div>"
+    fi
+
+    cat << HTMLEOF
 <div class="controls">
   <input class="search" type="text" id="srch" placeholder="🔍 Search checks..." onkeyup="ft()">
   <button class="filter-btn fb-all active" onclick="sf('all')">All (${TOTAL})</button>
   <button class="filter-btn fb-FAIL" onclick="sf('FAIL')">Fail (${FAIL})</button>
   <button class="filter-btn fb-WARN" onclick="sf('WARN')">Warn (${WARN})</button>
   <button class="filter-btn fb-PASS" onclick="sf('PASS')">Pass (${PASS})</button>
+  <button class="filter-btn fb-WAIVED" onclick="sf('WAIVED')">Waived (${WAIVED})</button>
   <button class="filter-btn fb-INFO" onclick="sf('INFO')">Info (${INFO})</button>
   <button class="filter-btn fb-SKIP" onclick="sf('SKIP')">Skip (${SKIP})</button>
 </div>
@@ -2381,70 +2966,78 @@ fi)
 <table id="t">
   <thead><tr>
     <th style="width:70px">Status</th>
-    <th style="width:130px">Check ID</th>
+    <th style="width:150px">Check ID</th>
     <th style="width:160px">Category</th>
     <th>Finding &amp; Remediation</th>
   </tr></thead>
   <tbody id="tb">
 HTMLEOF
-
-    while IFS= read -r line; do
-        local status id title cat desc rem
-        # Pure bash JSON field extraction — no python3/jq needed (air-gap safe)
-        status=$(json_field "status"      "$line")
-        id=$(json_field     "id"          "$line")
-        title=$(json_field  "title"       "$line")
-        cat=$(json_field    "category"    "$line")
-        desc=$(json_field   "description" "$line")
-        rem=$(json_field    "remediation" "$line")
-        [[ -z "$status" ]] && continue
-
-        local rem_html=""
-        [[ -n "$rem" && "$rem" != "N/A" ]] && rem_html="<div class='rem'>🔧 $(printf '%s' "$rem" | sed 's/</\&lt;/g;s/>/\&gt;/g')</div>"
-
-        cat >> "$hfile" << ROWEOF
-    <tr data-s="${status}">
-      <td><span class="badge b-${status}">${status}</span></td>
-      <td class="id-cell">${id}</td>
-      <td>${cat}</td>
-      <td><strong>$(printf '%s' "$title" | sed 's/</\&lt;/g;s/>/\&gt;/g')</strong><br><small style="color:#8b949e">$(printf '%s' "$desc" | sed 's/</\&lt;/g;s/>/\&gt;/g')</small>${rem_html}</td>
-    </tr>
-ROWEOF
-    done < "$RESULTS_FILE"
-
-    cat >> "$hfile" << HTMLEOF
+    cat "$HTML_ROWS_FILE"
+    cat << HTMLEOF
   </tbody>
 </table>
 
 <footer>
   ${TOOL_NAME} v${TOOL_VERSION} &nbsp;·&nbsp;
-  CIS RHEL 5–10 + DISA STIG v2 (RHEL 6–9) + Lynis Posture &nbsp;·&nbsp;
+  CIS RHEL 5–10 + DISA STIG (RHEL 6–9) + Built-in Hardening + Air-gap Isolation &nbsp;·&nbsp;
   Generated $(date) &nbsp;·&nbsp;
   For authorised security testing only
 </footer>
 
 <script>
-let cur='all';
+var cur='all';
 function sf(f){
   cur=f;
-  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelector('.fb-'+(f==='all'?'all':f)).classList.add('active');
+  var b=document.querySelectorAll('.filter-btn');
+  for(var i=0;i<b.length;i++) b[i].classList.remove('active');
+  document.querySelector('.fb-'+f).classList.add('active');
   ft();
 }
 function ft(){
-  const q=document.getElementById('srch').value.toLowerCase();
-  document.querySelectorAll('#tb tr').forEach(r=>{
-    const sm=cur==='all'||r.dataset.s===cur;
-    const tm=!q||r.innerText.toLowerCase().includes(q);
-    r.style.display=(sm&&tm)?'':'none';
-  });
+  var q=document.getElementById('srch').value.toLowerCase();
+  var r=document.querySelectorAll('#tb tr');
+  for(var i=0;i<r.length;i++){
+    var sm=cur==='all'||r[i].getAttribute('data-s')===cur;
+    var tm=!q||r[i].textContent.toLowerCase().indexOf(q)>-1;
+    r[i].style.display=(sm&&tm)?'':'none';
+  }
 }
 </script>
 </body>
 </html>
 HTMLEOF
-
+    } > "$hfile"
     echo "$hfile"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRANSFER BUNDLE — for carrying results across the air gap (sneakernet)
+# Produces <name>.tar.gz with the reports + MANIFEST.txt + SHA256SUMS, and
+# prints the bundle's own SHA-256 to record in the media transfer log.
+# ─────────────────────────────────────────────────────────────────────────────
+generate_bundle() {
+    local base="${TOOL_NAME}_${HOSTNAME_VAL}_${REPORT_TS}"
+    local stage="$OUTPUT_DIR/.${base}_bundle"
+    mkdir -p "$stage/$base" || return 1
+    cp "$@" "$stage/$base/" 2>/dev/null
+    {
+        echo "tool=$TOOL_NAME"
+        echo "version=$TOOL_VERSION"
+        echo "script_sha256=$SCRIPT_SHA256"
+        echo "hostname=$HOSTNAME_VAL"
+        echo "os=$RHEL_FULL"
+        echo "kernel=$(uname -r)"
+        echo "run_as_root=$IS_ROOT"
+        echo "operator=$(id -un 2>/dev/null)${SUDO_USER:+ (sudo from $SUDO_USER)}"
+        echo "created=$(date -Iseconds 2>/dev/null || date)"
+        echo "summary=pass:$PASS fail:$FAIL warn:$WARN waived:$WAIVED info:$INFO skip:$SKIP"
+    } > "$stage/$base/MANIFEST.txt"
+    if command -v sha256sum &>/dev/null; then
+        ( cd "$stage/$base" && sha256sum -- * > SHA256SUMS )
+    fi
+    ( cd "$stage" && tar czf "../${base}.tar.gz" "$base" ) || { rm -rf "$stage"; return 1; }
+    rm -rf "$stage"
+    echo "$OUTPUT_DIR/${base}.tar.gz"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2454,57 +3047,82 @@ main() {
     parse_args "$@"
     preflight
 
-    echo -e "\n${BOLD}${CYAN}"
-    echo "  ██████╗ ██╗  ██╗███████╗██╗      ██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗ "
-    echo "  ██╔══██╗██║  ██║██╔════╝██║     ██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗"
-    echo "  ██████╔╝███████║█████╗  ██║     ██║  ███╗██║   ██║███████║██████╔╝██║  ██║"
-    echo "  ██╔══██╗██╔══██║██╔══╝  ██║     ██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║"
-    echo "  ██║  ██║██║  ██║███████╗███████╗╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝"
-    echo "  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝"
-    echo -e "${RESET}"
-    echo -e "  ${BOLD}v${TOOL_VERSION}${RESET} · RHEL 5–10 · CIS + DISA STIG + Built-in Hardening · ${CYAN}${HOSTNAME_VAL}${RESET} (RHEL ${RHEL_MAJOR}) · Air-gap safe\n"
+    if [[ "$QUIET" == false ]]; then
+        echo -e "\n${BOLD}${CYAN}"
+        echo "  ██████╗ ██╗  ██╗███████╗██╗      ██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗ "
+        echo "  ██╔══██╗██║  ██║██╔════╝██║     ██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗"
+        echo "  ██████╔╝███████║█████╗  ██║     ██║  ███╗██║   ██║███████║██████╔╝██║  ██║"
+        echo "  ██╔══██╗██╔══██║██╔══╝  ██║     ██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║"
+        echo "  ██║  ██║██║  ██║███████╗███████╗╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝"
+        echo "  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝"
+        echo -e "${RESET}"
+        echo -e "  ${BOLD}v${TOOL_VERSION}${RESET} · RHEL 5–10 · CIS + DISA STIG + Hardening + Air-gap · ${CYAN}${HOSTNAME_VAL}${RESET} (RHEL ${RHEL_MAJOR})\n"
+    fi
 
     case "$SCAN_MODE" in
         cis)     run_cis_checks ;;
         stig)    run_stig_checks ;;
         posture) run_posture_checks; run_hardening_scan ;;
+        airgap)  run_airgap_checks ;;
         all)
             run_cis_checks
             run_stig_checks
             run_posture_checks
             run_hardening_scan
+            run_airgap_checks
             ;;
-        *) echo "Unknown mode: $SCAN_MODE. Use: cis|stig|posture|all"; exit 1 ;;
+        *) echo "Unknown mode: $SCAN_MODE. Use: cis|stig|posture|airgap|all"; exit 1 ;;
     esac
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    local cpct; cpct=$(awk "BEGIN{if($TOTAL>0) printf \"%.1f\", ($PASS/$TOTAL)*100; else print 0}")
+    compute_drift
+
+    # ── Summary (always printed, even with -q) ───────────────────────────────
+    local cpct; cpct=$(compliance_pct)
     local elapsed=$(( $(date +%s) - START_TS ))
 
     echo ""
     echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
     echo -e "${BOLD}  SCAN COMPLETE  ${elapsed}s  |  RHEL ${RHEL_MAJOR}  |  ${HOSTNAME_VAL}${RESET}"
     echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    printf "  ${GREEN}%-10s${RESET}%d\n"  "PASS"  "$PASS"
-    printf "  ${RED}%-10s${RESET}%d\n"    "FAIL"  "$FAIL"
-    printf "  ${YELLOW}%-10s${RESET}%d\n" "WARN"  "$WARN"
-    printf "  ${CYAN}%-10s${RESET}%d\n"   "INFO"  "$INFO"
-    printf "  %-10s%d\n"                  "SKIP"  "$SKIP"
+    printf "  ${GREEN}%-10s${RESET}%d\n"   "PASS"   "$PASS"
+    printf "  ${RED}%-10s${RESET}%d\n"     "FAIL"   "$FAIL"
+    printf "  ${YELLOW}%-10s${RESET}%d\n"  "WARN"   "$WARN"
+    printf "  ${MAGENTA}%-10s${RESET}%d\n" "WAIVED" "$WAIVED"
+    printf "  ${CYAN}%-10s${RESET}%d\n"    "INFO"   "$INFO"
+    printf "  %-10s%d\n"                   "SKIP"   "$SKIP"
     [[ "$IS_ROOT" == false ]] && printf "  ${YELLOW}%-10s${RESET}%d  (re-run as root for full coverage)\n" "PRIV-SKIP" "$PRIV_SKIP"
-    printf "  %-10s%d\n"                  "TOTAL" "$TOTAL"
-    echo -e "  ${BOLD}Compliance Score : ${cpct}%${RESET}"
+    printf "  %-10s%d\n"                   "TOTAL"  "$TOTAL"
+    echo -e "  ${BOLD}Compliance Score : ${cpct}%${RESET}  (pass / (pass+fail+warn))"
+    if [[ -n "$BASELINE_FILE" ]]; then
+        echo -e "  ${BOLD}Drift            : ${RED}${DRIFT_NEW_FAIL} new/regressed${RESET}${BOLD} · ${GREEN}${DRIFT_FIXED} fixed${RESET}"
+        grep -E '^(NEW|REGRESSED)' "$DRIFT_FILE" | head -15 | awk -F'\t' '{printf "      %-10s %-28s %s -> %s\n", $1, $2, $3, $4}'
+    fi
     echo ""
 
-    local jout hout
+    local jout hout cout bout
     log "Generating reports..."
     jout=$(generate_json_report)
     hout=$(generate_html_report)
+    cout=$(generate_csv_report)
 
-    echo -e "  📄 JSON  → ${CYAN}$jout${RESET}"
-    echo -e "  🌐 HTML  → ${CYAN}$hout${RESET}"
+    echo -e "  📄 JSON   → ${CYAN}$jout${RESET}"
+    echo -e "  🌐 HTML   → ${CYAN}$hout${RESET}"
+    echo -e "  📊 CSV    → ${CYAN}$cout${RESET}"
+
+    if [[ "$BUNDLE" == true ]]; then
+        if command -v tar &>/dev/null && bout=$(generate_bundle "$jout" "$hout" "$cout"); then
+            echo -e "  📦 BUNDLE → ${CYAN}$bout${RESET}"
+            command -v sha256sum &>/dev/null && \
+                echo -e "     sha256: $(sha256sum "$bout" | awk '{print $1}')   <- record this in your media transfer log"
+        else
+            echo -e "  ${YELLOW}Bundle could not be created (tar missing or write error).${RESET}"
+        fi
+    fi
     echo ""
-    echo -e "  ${GREEN}${BOLD}Done. Open the HTML report for full details.${RESET}"
-    echo ""
+    [[ "$QUIET" == false ]] && echo -e "  ${GREEN}${BOLD}Done. Open the HTML report for full details.${RESET}\n"
+
+    if [[ "$STRICT" == true && $FAIL -gt 0 ]]; then exit 2; fi
+    exit 0
 }
 
 main "$@"

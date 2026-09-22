@@ -13,6 +13,7 @@ A single, self-contained shell script that audits RHEL systems against CIS Bench
 | **CIS Benchmarks** | RHEL 5, 6, 7, 8, 9, 10 — L1 Server (auto-selected by detected version) |
 | **DISA STIG** | RHEL 6, 7, 8, 9 — CAT I (High) + key CAT II (Medium) findings |
 | **Posture Checks** | Crypto policy, file integrity, account hygiene, network exposure, SUID audit |
+| **Air-Gap Isolation** *(new in 2.2)* | Egress & bridging, radios (Wi-Fi/BT/WWAN/USB-tether), DMA ports, phone-home services, internet-facing repos, patch age, NTP/syslog/SSH-tunnel exposure |
 | **Built-in Hardening Scanner** | Embedded Lynis-equivalent covering 15 test categories: AUTH BOOT CRYP INSE KRNL LOGG MALW PKGS SCHD SHLL STRG TIME TOOL USERS HRDN — **no Lynis install needed, fully air-gap safe** |
 
 ---
@@ -63,12 +64,17 @@ RHELGuard **does not require root to run** — it will execute everything it can
 sudo ./rhelguard.sh [OPTIONS]
 
 OPTIONS:
-  -m, --mode       cis | stig | posture | all    (default: all)
-  -o, --output     Output directory               (default: ./rhelguard_reports)
-  -t, --throttle   ms delay between checks        (default: 50)
-  -s, --skip-lynis No-op (kept for compatibility — Lynis is no longer downloaded)
-  -q, --quiet      Suppress per-check output
-  -h, --help       Show this help
+  -m, --mode           cis | stig | posture | airgap | all   (default: all)
+  -o, --output         Output directory                      (default: ./rhelguard_reports)
+  -t, --throttle       ms delay between checks               (default: 50)
+  -b, --baseline FILE  Previous RHELGuard JSON — show drift since that scan
+  -w, --waivers FILE   Accepted deviations, one "CHECK-ID | reason" per line
+  -a, --max-patch-age  Days since last package change before flagging (default: 90)
+  -B, --bundle         Pack reports + MANIFEST + SHA256SUMS into a .tar.gz for transfer
+      --strict         Exit 2 if any FAIL remains (CI / automation)
+  -s, --skip-lynis     No-op (kept for compatibility)
+  -q, --quiet          Suppress per-check output (summary still printed)
+  -h, --help           Show this help
 ```
 
 ### Examples
@@ -89,9 +95,62 @@ sudo ./rhelguard.sh -m stig -t 200
 # Quiet mode (no console output, just reports)
 sudo ./rhelguard.sh -q
 
-# Air-gapped system — works out of the box, no flags needed
-sudo ./rhelguard.sh
+# Air-gap isolation checks only
+sudo ./rhelguard.sh -m airgap
+
+# Quarterly enclave audit: compare to last run, apply approved waivers, bundle for transfer
+sudo ./rhelguard.sh -b last_quarter.json -w enclave-waivers.txt -B --strict
 ```
+
+---
+
+## 🔌 Air-Gapped Operations
+
+RHELGuard is built for disconnected enclaves: every check reads local state (`/proc`, `/sys`, `/etc`, rpm DB) — nothing is resolved, fetched or probed, and the HTML report carries a strict Content-Security-Policy so it cannot load or send anything either.
+
+**1. Verify before transfer in.** Check the script against the published `SHA256SUMS` on your connected side, and again on the enclave side after media transfer:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+Each report records the `script_sha256` of the build that produced it, so an auditor can prove which version ran.
+
+**2. Scan.** `sudo ./rhelguard.sh -B` — works on a minimal install with no repos, no DNS and no default route.
+
+**3. Track drift without a SIEM.** Keep each JSON and feed it back next time with `-b`. The report lists every check that is **NEW**, **REGRESSED**, **FIXED** or **CHANGED**.
+
+**4. Record accepted risk.** Enclaves always have documented deviations. Put them in a waiver file and they show as `WAIVED` (with the reason) instead of failures, and are excluded from the score:
+
+```
+# enclave-waivers.txt
+AIR-NET-1      | Default route to enclave-only firewall, CAB-2291
+CIS-MOD-squashfs | Required by appliance image
+```
+
+Waiving a base ID (e.g. `STIG-PKG-tuned`) also covers suffixed duplicates.
+
+**5. Transfer out.** `-B` produces `RHELGuard_<host>_<ts>.tar.gz` containing the reports, a `MANIFEST.txt` (host, operator, script hash, summary) and `SHA256SUMS`, and prints the bundle hash for your media transfer log.
+
+### Air-gap checks (`-m airgap`)
+
+| ID | Checks |
+|---|---|
+| AIR-NET-1..4 | Default route (from `/proc`, works on RHEL 5), multi-homed host, IP forwarding, proxy settings (credentials masked) |
+| AIR-DNS-1 | Public/non-private DNS resolvers (DNS-tunnel & leak path) |
+| AIR-RF-1..4 | Wi-Fi interfaces/drivers, Bluetooth, cellular/WWAN modems + ModemManager, USB NIC / phone tethering drivers |
+| AIR-DMA-1 | Thunderbolt without authorisation, FireWire DMA |
+| AIR-USB-1 | udisks2 removable-media automount |
+| AIR-SVC-* | rhsmcertd, insights-client, rhcd, dnf-makecache/automatic, yum-cron, PackageKit, avahi, cups-browsed, cloud-init, geoclue, network kdump |
+| AIR-RHSM-1 | subscription-manager pointed at the public CDN instead of Satellite |
+| AIR-REPO-1 | Enabled repos using public mirrors, mirrorlist or metalink |
+| AIR-PATCH-1 | Days since last package change vs `--max-patch-age` (the real risk of a disconnected host) |
+| AIR-PATCH-2 | Running kernel older than newest installed kernel (reboot pending) |
+| AIR-TIME-1 | Missing or public NTP sources |
+| AIR-LOG-1 | Log forwarding to public destinations |
+| AIR-SSH-1 | TCP/agent/stream forwarding, PermitTunnel, GatewayPorts, X11 |
+
+Public destinations are private-range IP checks plus a list of well-known internet domains (`AIRGAP_PUBLIC_PATTERNS` near the top of the air-gap section — extend it for your environment).
 
 ---
 
@@ -116,7 +175,9 @@ Also works on compatible derivatives: **CentOS**, **AlmaLinux**, **Rocky Linux**
 
 The report is a standalone HTML file — no server required, open in any browser.
 
-- **Compliance Score** — percentage circle with colour coding (red/amber/green)
+- **Compliance Score** — `pass ÷ (pass + fail + warn)`; INFO, SKIP and WAIVED don't count against you
+- **Drift panel** — changes since the `--baseline` scan
+- **Offline-locked** — CSP blocks all network loads; all values HTML-escaped
 - **Progress bar** — visual compliance fill bar
 - **Summary cards** — PASS / FAIL / WARN / INFO / SKIP at a glance
 - **Non-root warning** — banner showing how many checks were privilege-skipped
@@ -129,10 +190,14 @@ The report is a standalone HTML file — no server required, open in any browser
 ## 📁 Output Files
 
 ```
-rhelguard_reports/
+rhelguard_reports/                            (created with umask 077)
 ├── RHELGuard_<hostname>_<timestamp>.html    ← Human dashboard
-└── RHELGuard_<hostname>_<timestamp>.json    ← Machine-readable
+├── RHELGuard_<hostname>_<timestamp>.json    ← Machine-readable / baseline input
+├── RHELGuard_<hostname>_<timestamp>.csv     ← Spreadsheet / GRC import
+└── RHELGuard_<hostname>_<timestamp>.tar.gz  ← with -B: reports + MANIFEST + SHA256SUMS
 ```
+
+Exit codes: `0` scan completed · `1` usage/setup error · `2` FAILs present (only with `--strict`).
 
 ---
 
@@ -164,10 +229,9 @@ HOSTS=(web01 db01 app01 bastion01)
 for host in "${HOSTS[@]}"; do
     echo "Scanning $host..."
     scp rhelguard.sh root@${host}:/tmp/
-    ssh root@${host} "chmod +x /tmp/rhelguard.sh && /tmp/rhelguard.sh -q -s -o /tmp/rg_out"
+    ssh root@${host} "chmod +x /tmp/rhelguard.sh && /tmp/rhelguard.sh -q -B -o /tmp/rg_out"
     mkdir -p collected/${host}
-    scp "root@${host}:/tmp/rg_out/*.json" collected/${host}/
-    scp "root@${host}:/tmp/rg_out/*.html" collected/${host}/
+    scp "root@${host}:/tmp/rg_out/*.tar.gz" collected/${host}/
 done
 echo "All done. Reports in ./collected/"
 ```
@@ -188,6 +252,15 @@ jq '.results[] | select(.status=="FAIL" and .category=="ACCESS CONTROL")' RHELGu
 
 # Count skipped due to non-root
 jq '.summary.priv_skip' RHELGuard_*.json
+
+# What regressed since the baseline?
+jq '.drift[] | select(.change=="REGRESSED" or .change=="NEW")' RHELGuard_*.json
+```
+
+No `jq` inside the enclave? Results are one JSON object per line, so plain grep works:
+
+```bash
+grep '"status":"FAIL"' RHELGuard_*.json
 ```
 
 ---

@@ -1,0 +1,7 @@
+# RHELGuard waiver file — one accepted deviation per line:
+#   CHECK-ID | reason / approval reference
+# Matching FAIL/WARN results become WAIVED (excluded from the score, reason shown in reports).
+# Waiving a base ID also covers auto-suffixed duplicates (e.g. CIS-PW-PQ covers CIS-PW-PQ.2).
+
+AIR-NET-1        | Default route points at enclave-only firewall — CAB-0000
+CIS-MOD-squashfs | Required for vendor appliance images — RISK-0000
