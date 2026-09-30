@@ -2,7 +2,20 @@
 
 > **Red Hat Enterprise Linux Security Audit Tool**
 
-A single, self-contained shell script that audits RHEL systems against CIS Benchmarks, DISA STIGs, and a built-in hardening scanner — with **full non-root support**, auto OS detection, and beautiful HTML + JSON reports. **100% air-gap safe — no internet connection required, zero external dependencies.**
+A single, self-contained script that audits RHEL systems against CIS Benchmarks, DISA STIGs, and a built-in hardening scanner — with **full non-root support**, auto OS detection, and beautiful HTML + JSON reports. **100% air-gap safe — no internet connection required, zero external dependencies.**
+
+Available as **two interchangeable engines** — pick whichever your host policy allows:
+
+| File | Runs with | Requires |
+|---|---|---|
+| **`rhelguard.sh`** | `bash rhelguard.sh` | bash 3.2+ and base RHEL utilities |
+| **`rhelguard.py`** | `python3 rhelguard.py` | Python 3.6+ (standard library only) |
+
+`rhelguard.py` is a **native re-implementation, not a wrapper** — it does not
+call, embed or extract the shell script. Both engines emit the same check IDs
+and the same JSON/CSV/HTML reports, so a baseline taken with one can be diffed
+with the other. Use the Python engine where local policy, change control or a
+file-transfer gateway will not accept a `.sh` file.
 
 ---
 
@@ -20,18 +33,29 @@ A single, self-contained shell script that audits RHEL systems against CIS Bench
 
 ## 🚀 Quick Start
 
+### Shell engine
+
 ```bash
-# Copy to target
 scp rhelguard.sh user@server:/tmp/
 
-# Full scan (recommended)
-sudo chmod +x /tmp/rhelguard.sh
-sudo /tmp/rhelguard.sh
-
-# Non-root partial scan (privileged checks auto-skipped)
-chmod +x /tmp/rhelguard.sh
-./rhelguard.sh
+sudo bash /tmp/rhelguard.sh          # full scan (recommended)
+bash /tmp/rhelguard.sh               # non-root partial scan
 ```
+
+### Python engine — when `.sh` files are not permitted
+
+```bash
+scp rhelguard.py user@server:/tmp/
+
+sudo python3 /tmp/rhelguard.py       # full scan (recommended)
+python3 /tmp/rhelguard.py            # non-root partial scan
+```
+
+Both take the same options. Invoking the interpreter explicitly
+(`bash …` / `python3 …`) rather than `./rhelguard.*` also means the file needs
+no execute bit, which matters on a `noexec` mount such as a hardened `/tmp` —
+under `noexec` **neither** file can be run as `./rhelguard.*`, but both work
+when the interpreter is called directly.
 
 Reports saved to `./rhelguard_reports/` — open the `.html` file in any browser.
 
@@ -39,7 +63,7 @@ Reports saved to `./rhelguard_reports/` — open the `.html` file in any browser
 
 ## 🔍 Non-Root Mode
 
-RHELGuard **does not require root to run** — it will execute everything it can and cleanly skip checks that require elevated privileges, clearly marking them `SKIP (root required)` in the report.
+Both engines **do not require root to run** — it will execute everything it can and cleanly skip checks that require elevated privileges, clearly marking them `SKIP (root required)` in the report.
 
 | Check Type | Non-Root | Root |
 |---|---|---|
@@ -58,10 +82,53 @@ RHELGuard **does not require root to run** — it will execute everything it can
 
 ---
 
+## 🐍 Python Engine (`rhelguard.py`)
+
+For hosts where a `.sh` file is not acceptable — local policy forbidding shell
+scripts, change control that only approves Python, or a transfer gateway that
+strips the extension.
+
+**It is a real port, not a wrapper.** There is no embedded, encoded or
+downloaded copy of `rhelguard.sh` inside it; every check is implemented in
+Python against the same sources (`/proc`, `/sys`, `/etc`, the rpm DB). Nothing
+is installed and nothing is fetched.
+
+| | |
+|---|---|
+| **Interpreter** | Python 3.6+ — RHEL 8 ships 3.6, RHEL 9/10 ship 3.9+ |
+| **Dependencies** | Standard library only. No pip, no venv, no network |
+| **Privileges** | Same as the shell engine: runs as any user, skips privileged checks |
+| **Output** | Same JSON / CSV / HTML filenames and schema |
+| **Parity** | Verified identical to `rhelguard.sh` on RHEL 9 and RHEL 8, in all five modes, as root and non-root |
+
+```bash
+python3 rhelguard.py --help
+python3 rhelguard.py --version
+sudo python3 rhelguard.py -m all -B
+```
+
+On **RHEL 7 and older** the system Python is 2.7; install `python3` (or `python36`)
+or use the shell engine there instead.
+
+Where the two engines deliberately read the system differently, the Python one
+is the more portable of the two — it reads `/proc/sys` instead of calling
+`sysctl`, `/proc/self/mountinfo` instead of `findmnt`, and `/proc/modules`
+instead of `lsmod`, so it needs no `procps-ng` or `util-linux`. As of 2.3.0 the
+shell engine does the same, which is why their results match exactly.
+
+Reports state which engine produced them:
+
+```bash
+jq -r '.engine' RHELGuard_*.json     # -> "bash" or "python3"
+```
+
+---
+
 ## ⚙️ Usage
 
 ```
-sudo ./rhelguard.sh [OPTIONS]
+sudo bash   rhelguard.sh [OPTIONS]
+sudo python3 rhelguard.py [OPTIONS]
 
 OPTIONS:
   -m, --mode           cis | stig | posture | airgap | all   (default: all)
@@ -79,27 +146,34 @@ OPTIONS:
 
 ### Examples
 
+Swap `bash rhelguard.sh` for `python3 rhelguard.py` in any of these — the
+options are identical.
+
 ```bash
 # Full scan — all frameworks
-sudo ./rhelguard.sh
+sudo bash rhelguard.sh
 
 # CIS only, custom output dir
-sudo ./rhelguard.sh -m cis -o /var/log/rhelguard
+sudo bash rhelguard.sh -m cis -o /var/log/rhelguard
 
 # STIG only, higher throttle for busy production system
-sudo ./rhelguard.sh -m stig -t 200
+sudo bash rhelguard.sh -m stig -t 200
 
 # Non-root partial scan
-./rhelguard.sh
+bash rhelguard.sh
 
 # Quiet mode (no console output, just reports)
-sudo ./rhelguard.sh -q
+sudo bash rhelguard.sh -q
 
 # Air-gap isolation checks only
-sudo ./rhelguard.sh -m airgap
+sudo python3 rhelguard.py -m airgap
 
 # Quarterly enclave audit: compare to last run, apply approved waivers, bundle for transfer
-sudo ./rhelguard.sh -b last_quarter.json -w enclave-waivers.txt -B --strict
+sudo python3 rhelguard.py -b last_quarter.json -w enclave-waivers.txt -B --strict
+
+# A baseline from either engine works with either engine
+sudo bash    rhelguard.sh -o out1
+sudo python3 rhelguard.py -b out1/RHELGuard_*.json
 ```
 
 ---
@@ -111,12 +185,12 @@ RHELGuard is built for disconnected enclaves: every check reads local state (`/p
 **1. Verify before transfer in.** Check the script against the published `SHA256SUMS` on your connected side, and again on the enclave side after media transfer:
 
 ```bash
-sha256sum -c SHA256SUMS
+sha256sum -c SHA256SUMS      # covers rhelguard.sh and rhelguard.py
 ```
 
 Each report records the `script_sha256` of the build that produced it, so an auditor can prove which version ran.
 
-**2. Scan.** `sudo ./rhelguard.sh -B` — works on a minimal install with no repos, no DNS and no default route.
+**2. Scan.** `sudo bash rhelguard.sh -B` (or `sudo python3 rhelguard.py -B`) — works on a minimal install with no repos, no DNS and no default route.
 
 **3. Track drift without a SIEM.** Keep each JSON and feed it back next time with `-b`. The report lists every check that is **NEW**, **REGRESSED**, **FIXED** or **CHANGED**.
 
@@ -216,7 +290,8 @@ Exit codes: `0` scan completed · `1` usage/setup error · `2` FAILs present (on
 For very busy production systems:
 
 ```bash
-sudo ./rhelguard.sh -t 500   # 500ms throttle for very busy systems
+sudo bash rhelguard.sh -t 500      # 500ms throttle for very busy systems
+sudo python3 rhelguard.py -t 500   # same option on the Python engine
 ```
 
 ---
@@ -229,7 +304,7 @@ HOSTS=(web01 db01 app01 bastion01)
 for host in "${HOSTS[@]}"; do
     echo "Scanning $host..."
     scp rhelguard.sh root@${host}:/tmp/
-    ssh root@${host} "chmod +x /tmp/rhelguard.sh && /tmp/rhelguard.sh -q -B -o /tmp/rg_out"
+    ssh root@${host} "bash /tmp/rhelguard.sh -q -B -o /tmp/rg_out"
     mkdir -p collected/${host}
     scp "root@${host}:/tmp/rg_out/*.tar.gz" collected/${host}/
 done
