@@ -6,3 +6,5 @@ lynis*/
 *.json
 *.html
 !docs/
+__pycache__/
+*.pyc

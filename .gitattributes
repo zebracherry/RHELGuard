@@ -1,0 +1,18 @@
+# RHELGuard ships executable scripts that run on Linux. A Windows clone with
+# core.autocrlf=true (the Git-for-Windows default) rewrites them to CRLF, and
+# the shebang line then ends in a carriage return:
+#
+#     $ ./rhelguard.sh
+#     env: 'bash\r': No such file or directory
+#
+# Forcing LF on checkout keeps the files runnable no matter which OS they were
+# cloned or downloaded on before being transferred to the target host.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+SHA256SUMS text eol=lf
+LICENSE    text eol=lf

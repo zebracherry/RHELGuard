@@ -8,14 +8,18 @@
 #  ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝
 #
 #  RHELGuard — Red Hat Enterprise Linux Security Audit Tool
-#  Version : 2.2.0
+#  Version : 2.3.0
 #  Covers  : RHEL 5, 6, 7, 8, 9, 10 (auto-detected)
 #  Sources : CIS Benchmarks (L1/L2) + DISA STIG v2 + Lynis-style posture
 #  License : MIT
 # =============================================================================
 # USAGE:
-#         ./rhelguard.sh [OPTIONS]           # non-root: partial scan
-#   sudo  ./rhelguard.sh [OPTIONS]           # full scan (recommended)
+#         bash rhelguard.sh [OPTIONS]        # non-root: partial scan
+#   sudo  bash rhelguard.sh [OPTIONS]        # full scan (recommended)
+#
+#   Calling bash explicitly needs no execute bit and works on a noexec mount.
+#   A Python engine with identical options and output ships as rhelguard.py,
+#   for hosts where a .sh file is not permitted:  python3 rhelguard.py
 #
 # OPTIONS:
 #   -m, --mode       cis | stig | posture | airgap | all  (default: all)
@@ -51,7 +55,8 @@ umask 077
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 readonly TOOL_NAME="RHELGuard"
-readonly TOOL_VERSION="2.2.0"
+readonly TOOL_VERSION="2.3.0"
+readonly TOOL_ENGINE="bash"
 SCAN_MODE="all"
 OUTPUT_DIR="./rhelguard_reports"
 THROTTLE_MS=50
@@ -68,7 +73,20 @@ SCRIPT_SHA256="unavailable"
 DRIFT_NEW_FAIL=0; DRIFT_FIXED=0; DRIFT_CHANGED=0
 START_TS=$(date +%s)
 REPORT_TS=$(date +"%Y%m%d_%H%M%S")
-HOSTNAME_VAL=$(hostname -s 2>/dev/null || echo "unknown")
+# `hostname` is NOT installed on RHEL minimal installs / UBI containers.
+# Fall back to uname -n, then the kernel, then $HOSTNAME, then "unknown".
+_rg_hostname() {
+    local h=""
+    h=$(hostname -s 2>/dev/null) && [[ -n "$h" ]] && { printf '%s' "$h"; return; }
+    h=$(uname -n 2>/dev/null)    && [[ -n "$h" ]] && { printf '%s' "${h%%.*}"; return; }
+    if [[ -r /proc/sys/kernel/hostname ]]; then
+        read -r h < /proc/sys/kernel/hostname
+        [[ -n "$h" ]] && { printf '%s' "${h%%.*}"; return; }
+    fi
+    [[ -n "${HOSTNAME:-}" ]] && { printf '%s' "${HOSTNAME%%.*}"; return; }
+    printf 'unknown'
+}
+HOSTNAME_VAL=$(_rg_hostname)
 
 # Privilege flag — set once, used everywhere
 IS_ROOT=false
@@ -103,12 +121,44 @@ run_to() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SYSCTL — read /proc/sys directly, fall back to the binary.
+# `sysctl` lives in procps-ng, which is NOT installed on RHEL minimal installs
+# or UBI containers. The old code returned "N/A" there and reported every
+# kernel/network parameter as FAIL on a correctly hardened host.
+# ─────────────────────────────────────────────────────────────────────────────
+_sysctl_get() {
+    local name="$1" path v
+    path="/proc/sys/${name//.//}"
+    if [[ -r "$path" ]]; then
+        IFS= read -r v < "$path" 2>/dev/null
+        [[ -n "$v" ]] && { printf '%s' "$v"; return; }
+    fi
+    if command -v sysctl &>/dev/null; then
+        v=$(sysctl -n "$name" 2>/dev/null)
+        [[ -n "$v" ]] && { printf '%s' "$v"; return; }
+    fi
+    printf 'N/A'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE NORMALISATION — `stat -Lc %a` prints mode 0000 as "0", not "000", so
+# comparing it against the literal "000" made a correctly locked /etc/shadow
+# (mode 0000 on RHEL 9) report as FAIL. Pad to at least three octal digits.
+# ─────────────────────────────────────────────────────────────────────────────
+_norm_mode() {
+    local m="$1"
+    [[ "$m" =~ ^[0-7]+$ ]] || { printf '%s' "$m"; return; }
+    while [[ ${#m} -lt 3 ]]; do m="0${m}"; done
+    printf '%s' "$m"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DEPENDENCY CHECK — warn about missing optional tools, never hard-fail
 # All REQUIRED tools are bash builtins or guaranteed on any RHEL install.
 # ─────────────────────────────────────────────────────────────────────────────
 check_deps() {
     # These are REQUIRED — present on every RHEL 5+ system
-    local required=(awk sed grep find stat rpm uname date hostname)
+    local required=(awk sed grep find stat rpm uname date)
     local missing=()
     for t in "${required[@]}"; do
         command -v "$t" &>/dev/null || missing+=("$t")
@@ -120,7 +170,7 @@ check_deps() {
     fi
 
     # These are OPTIONAL — degrade gracefully if absent
-    local optional=(systemctl sshd getenforce sestatus ss findmnt auditctl lsblk blkid ip mokutil chage sha256sum tar)
+    local optional=(hostname systemctl sshd getenforce sestatus ss findmnt auditctl lsblk blkid ip mokutil chage sha256sum tar)
     local absent=()
     for t in "${optional[@]}"; do
         command -v "$t" &>/dev/null || absent+=("$t")
@@ -484,7 +534,8 @@ run_cis_checks() {
     # RHEL 9: localpkg_gpgcheck
     if rhel_ge 9; then
         local local_gpg
-        local_gpg=$(grep -iE "^\s*localpkg_gpgcheck" /etc/dnf/dnf.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+        local_gpg=$(grep -iE "^\s*localpkg_gpgcheck" /etc/dnf/dnf.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+        [[ -z "$local_gpg" ]] && local_gpg="N/A"
         if [[ "$local_gpg" == "1" ]]; then
             record_result "PASS" "CIS-PKG-3" "localpkg_gpgcheck = 1 (RHEL 9+)" \
                 "SYSTEM INTEGRITY" "Local package GPG check is enforced." ""
@@ -548,7 +599,8 @@ run_cis_checks() {
             "ACCESS CONTROL" "No selinux=0 or enforcing=0 in grub config." ""
     fi
 
-    local semode; semode=$(getenforce 2>/dev/null || echo "Unknown")
+    local semode; semode=$(getenforce 2>/dev/null)
+    [[ -z "$semode" ]] && semode="Unknown"
     case "$semode" in
         Enforcing)
             record_result "PASS" "CIS-SEL-3" "SELinux mode = Enforcing" \
@@ -563,7 +615,8 @@ run_cis_checks() {
                 "Set SELINUX=enforcing in /etc/selinux/config and reboot." ;;
     esac
 
-    local sepol; sepol=$(sestatus 2>/dev/null | awk '/Loaded policy/{print $NF}' || echo "N/A")
+    local sepol; sepol=$(sestatus 2>/dev/null | awk '/Loaded policy/{print $NF}')
+    [[ -z "$sepol" ]] && sepol="N/A"
     if [[ "$sepol" == "targeted" || "$sepol" == "mls" ]]; then
         record_result "PASS" "CIS-SEL-4" "SELinux policy = $sepol" \
             "ACCESS CONTROL" "SELinux policy type is valid." ""
@@ -604,7 +657,8 @@ run_cis_checks() {
             "Set bootloader password: grub2-setpassword  (RHEL 7+) or edit /boot/grub/grub.conf (RHEL 5/6)"
     fi
 
-    local grub_perm; grub_perm=$(stat -Lc "%a" "$grub_cfg" 2>/dev/null || echo "N/A")
+    local grub_perm; grub_perm=$(stat -Lc "%a" "$grub_cfg" 2>/dev/null)
+    [[ -z "$grub_perm" ]] && grub_perm="N/A"
     if [[ "$grub_perm" == "600" || "$grub_perm" == "400" ]]; then
         record_result "PASS" "CIS-BOOT-2" "Bootloader config permissions = $grub_perm" \
             "ACCESS CONTROL" "$grub_cfg is appropriately restricted." ""
@@ -616,7 +670,8 @@ run_cis_checks() {
 
     # RHEL 9: grub.cfg ownership
     if rhel_ge 9; then
-        local grub_owner; grub_owner=$(stat -Lc "%U:%G" "$grub_cfg" 2>/dev/null || echo "N/A")
+        local grub_owner; grub_owner=$(stat -Lc "%U:%G" "$grub_cfg" 2>/dev/null)
+        [[ -z "$grub_owner" ]] && grub_owner="N/A"
         if [[ "$grub_owner" == "root:root" ]]; then
             record_result "PASS" "CIS-BOOT-3" "grub.cfg owned by root:root" \
                 "ACCESS CONTROL" "Bootloader config has correct ownership." ""
@@ -660,7 +715,7 @@ run_cis_checks() {
 
     for item in "${sysctl_checks[@]}"; do
         IFS=':' read -r param expected cid <<< "$item"
-        local actual; actual=$(sysctl -n "$param" 2>/dev/null || echo "N/A")
+        local actual; actual=$(_sysctl_get "$param")
         if [[ "$actual" == "$expected" ]]; then
             record_result "PASS" "$cid" "$param = $actual" \
                 "CONFIGURATION MANAGEMENT" "Kernel parameter $param is correctly set." ""
@@ -672,7 +727,8 @@ run_cis_checks() {
     done
 
     # Core dump checks
-    local core_storage; core_storage=$(grep -E "^\s*Storage\s*=" /etc/systemd/coredump.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+    local core_storage; core_storage=$(grep -E "^\s*Storage\s*=" /etc/systemd/coredump.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+    [[ -z "$core_storage" ]] && core_storage="N/A"
     if [[ "$core_storage" == "none" ]]; then
         record_result "PASS" "CIS-KERN-11" "systemd-coredump Storage = none" \
             "CONFIGURATION MANAGEMENT" "Core dump storage is disabled." ""
@@ -781,7 +837,7 @@ run_cis_checks() {
 
     for item in "${net_checks[@]}"; do
         IFS=':' read -r param expected cid <<< "$item"
-        local actual; actual=$(sysctl -n "$param" 2>/dev/null || echo "N/A")
+        local actual; actual=$(_sysctl_get "$param")
         if [[ "$actual" == "$expected" ]]; then
             record_result "PASS" "$cid" "$param = $actual" \
                 "NETWORK CONFIGURATION" "Network parameter $param is correct." ""
@@ -821,7 +877,7 @@ run_cis_checks() {
 
     # auditd config checks
     if [[ -f /etc/audit/auditd.conf ]]; then
-        local max_action; max_action=$(grep -iE "^\s*max_log_file_action" /etc/audit/auditd.conf | awk -F= '{print $2}' | tr -d ' ')
+        local max_action; max_action=$(grep -iE "^\s*max_log_file_action" /etc/audit/auditd.conf | tail -1 | awk -F= '{print $2}' | tr -d ' ')
         if echo "$max_action" | grep -qiE "keep_logs|rotate"; then
             record_result "PASS" "CIS-AUD-2" "max_log_file_action = $max_action" \
                 "AUDIT AND ACCOUNTABILITY" "Audit log rotation is configured." ""
@@ -831,7 +887,7 @@ run_cis_checks() {
                 "Set max_log_file_action = keep_logs in /etc/audit/auditd.conf"
         fi
 
-        local sla; sla=$(grep -iE "^\s*space_left_action" /etc/audit/auditd.conf | awk -F= '{print $2}' | tr -d ' ')
+        local sla; sla=$(grep -iE "^\s*space_left_action" /etc/audit/auditd.conf | tail -1 | awk -F= '{print $2}' | tr -d ' ')
         if echo "$sla" | grep -qiE "email|exec|syslog|rotate"; then
             record_result "PASS" "CIS-AUD-3" "space_left_action = $sla" \
                 "AUDIT AND ACCOUNTABILITY" "Audit space_left_action notifies administrators." ""
@@ -938,8 +994,9 @@ run_cis_checks() {
 
         for item in "${ssh_checks[@]}"; do
             IFS=':' read -r directive expected cid <<< "$item"
-            local actual; actual=$(sshd -T 2>/dev/null | grep -i "^${directive} " | awk '{print tolower($2)}' || echo "")
-            [[ -z "$actual" ]] && actual=$(grep -iE "^\s*${directive}\s+" "$ssh_conf" 2>/dev/null | awk '{print tolower($2)}' || echo "N/A")
+            local actual; actual=$(sshd -T 2>/dev/null | awk -v d="$directive" 'tolower($1)==tolower(d){print tolower($2); exit}')
+            [[ -z "$actual" ]] && actual=$(grep -iE "^[[:space:]]*${directive}[[:space:]]+" "$ssh_conf" 2>/dev/null | awk '{print tolower($2); exit}')
+            [[ -z "$actual" ]] && actual="N/A"
             local exp_lc; exp_lc=$(echo "$expected" | tr '[:upper:]' '[:lower:]')
 
             if [[ "$actual" == "$exp_lc" ]]; then
@@ -953,7 +1010,9 @@ run_cis_checks() {
         done
 
         # MaxAuthTries (numeric comparison)
-        local mat; mat=$(sshd -T 2>/dev/null | grep -i "^maxauthtries " | awk '{print $2}' || grep -iE "MaxAuthTries" "$ssh_conf" | awk '{print $2}' || echo "N/A")
+        local mat; mat=$(sshd -T 2>/dev/null | awk 'tolower($1)=="maxauthtries"{print $2; exit}')
+        [[ -z "$mat" ]] && mat=$(grep -iE "^[[:space:]]*MaxAuthTries[[:space:]]+" "$ssh_conf" 2>/dev/null | awk '{print $2; exit}')
+        [[ -z "$mat" ]] && mat="N/A"
         if [[ "$mat" =~ ^[0-9]+$ ]] && [[ "$mat" -le "$max_auth" ]]; then
             record_result "PASS" "CIS-SSH-MAT" "SSH MaxAuthTries = $mat (≤$max_auth)" \
                 "ACCESS CONTROL" "MaxAuthTries is within acceptable range." ""
@@ -984,7 +1043,8 @@ run_cis_checks() {
         )
         for item in "${pw_checks[@]}"; do
             IFS=':' read -r param expected comp cid <<< "$item"
-            local actual; actual=$(grep -E "^\s*${param}\s+" "$login_defs" | awk '{print $2}' || echo "N/A")
+            local actual; actual=$(grep -E "^\s*${param}\s+" "$login_defs" | tail -1 | awk '{print $2}')
+            [[ -z "$actual" ]] && actual="N/A"
             local ok=false
             if [[ "$actual" =~ ^[0-9]+$ ]]; then
                 [[ "$comp" == "max" ]] && [[ "$actual" -le "$expected" ]] && ok=true
@@ -1001,7 +1061,8 @@ run_cis_checks() {
         done
 
         # SHA512 hashing
-        local encrypt; encrypt=$(grep -E "^\s*ENCRYPT_METHOD" "$login_defs" | awk '{print $2}' || echo "N/A")
+        local encrypt; encrypt=$(grep -E "^\s*ENCRYPT_METHOD" "$login_defs" | tail -1 | awk '{print $2}')
+        [[ -z "$encrypt" ]] && encrypt="N/A"
         if echo "$encrypt" | grep -qiE "SHA512|SHA256"; then
             record_result "PASS" "CIS-PW-5" "ENCRYPT_METHOD = $encrypt" \
                 "SYSTEM INTEGRITY" "FIPS-approved password hashing in use." ""
@@ -1015,7 +1076,8 @@ run_cis_checks() {
     # pwquality (RHEL 7+)
     if rhel_ge 7 && [[ -f /etc/security/pwquality.conf ]]; then
         for opt in minlen dcredit ucredit lcredit ocredit; do
-            local val; val=$(grep -E "^\s*${opt}\s*=" /etc/security/pwquality.conf | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+            local val; val=$(grep -E "^\s*${opt}\s*=" /etc/security/pwquality.conf | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+            [[ -z "$val" ]] && val="N/A"
             if [[ "$opt" == "minlen" ]]; then
                 if [[ "$val" =~ ^[0-9]+$ ]] && [[ "$val" -ge 14 ]]; then
                     record_result "PASS" "CIS-PW-PQ" "pwquality $opt = $val (≥14)" \
@@ -1042,7 +1104,8 @@ run_cis_checks() {
     if rhel_ge 8; then
         local fconf="/etc/security/faillock.conf"
         if [[ -f "$fconf" ]]; then
-            local deny; deny=$(grep -E "^\s*deny\s*=" "$fconf" | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+            local deny; deny=$(grep -E "^\s*deny\s*=" "$fconf" | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+            [[ -z "$deny" ]] && deny="N/A"
             if [[ "$deny" =~ ^[0-9]+$ ]] && [[ "$deny" -le 3 ]] && [[ "$deny" -gt 0 ]]; then
                 record_result "PASS" "CIS-PW-FL1" "faillock deny = $deny (≤3)" \
                     "ACCESS CONTROL" "Account lockout threshold is ≤3." ""
@@ -1052,7 +1115,8 @@ run_cis_checks() {
                     "Set 'deny = 3' in /etc/security/faillock.conf"
             fi
 
-            local utime; utime=$(grep -E "^\s*unlock_time\s*=" "$fconf" | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+            local utime; utime=$(grep -E "^\s*unlock_time\s*=" "$fconf" | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+            [[ -z "$utime" ]] && utime="N/A"
             if [[ "$utime" == "0" ]] || ( [[ "$utime" =~ ^[0-9]+$ ]] && [[ "$utime" -ge 900 ]] ); then
                 record_result "PASS" "CIS-PW-FL2" "faillock unlock_time = $utime (0 or ≥900s)" \
                     "ACCESS CONTROL" "Account unlock requires admin or ≥15 min." ""
@@ -1079,7 +1143,8 @@ run_cis_checks() {
     fi
 
     # Default umask
-    local umask_val; umask_val=$(grep -hE "^\s*umask\s+" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | awk '{print $2}' | sort -u | head -1 || echo "N/A")
+    local umask_val; umask_val=$(grep -hE "^\s*umask\s+" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | awk '{print $2}' | sort -u | head -1)
+    [[ -z "$umask_val" ]] && umask_val="N/A"
     if [[ "$umask_val" == "027" || "$umask_val" == "077" ]]; then
         record_result "PASS" "CIS-PW-UM" "Default umask = $umask_val" \
             "ACCESS CONTROL" "Default umask is restrictive." ""
@@ -1090,7 +1155,8 @@ run_cis_checks() {
     fi
 
     # TMOUT (session timeout)
-    local tmout; tmout=$(grep -hE "^\s*(readonly\s+)?TMOUT" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | grep -oE "[0-9]+" | head -1 || echo "N/A")
+    local tmout; tmout=$(grep -hE "^\s*(readonly\s+)?TMOUT" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | grep -oE "[0-9]+" | head -1)
+    [[ -z "$tmout" ]] && tmout="N/A"
     if [[ "$tmout" =~ ^[0-9]+$ ]] && [[ "$tmout" -le 600 ]]; then
         record_result "PASS" "CIS-PW-TO" "TMOUT = $tmout seconds (≤600)" \
             "ACCESS CONTROL" "Idle session timeout is configured." ""
@@ -1122,9 +1188,11 @@ run_cis_checks() {
             continue
         fi
 
-        local actual_perm; actual_perm=$(stat -Lc "%a" "$filepath" 2>/dev/null || echo "N/A")
-        local actual_owner; actual_owner=$(stat -Lc "%U" "$filepath" 2>/dev/null || echo "N/A")
-        local actual_group; actual_group=$(stat -Lc "%G" "$filepath" 2>/dev/null || echo "N/A")
+        local actual_perm; actual_perm=$(_norm_mode "$(stat -Lc "%a" "$filepath" 2>/dev/null || echo "N/A")")
+        local actual_owner; actual_owner=$(stat -Lc "%U" "$filepath" 2>/dev/null)
+        [[ -z "$actual_owner" ]] && actual_owner="N/A"
+        local actual_group; actual_group=$(stat -Lc "%G" "$filepath" 2>/dev/null)
+        [[ -z "$actual_group" ]] && actual_group="N/A"
 
         # Shadow files: RHEL < 9 allows 640, RHEL 9+ requires 000
         local expected_perm="$perm"
@@ -1192,7 +1260,8 @@ run_cis_checks() {
     fi
 
     # Inactive account lockout
-    local inactive; inactive=$(grep -E "^\s*INACTIVE" /etc/default/useradd 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+    local inactive; inactive=$(grep -E "^\s*INACTIVE" /etc/default/useradd 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+    [[ -z "$inactive" ]] && inactive="N/A"
     local max_inactive=35
     rhel_ge 9 && max_inactive=35
     if [[ "$inactive" =~ ^[0-9]+$ ]] && [[ "$inactive" -le "$max_inactive" ]] && [[ "$inactive" -gt 0 ]]; then
@@ -1246,7 +1315,8 @@ run_stig_checks() {
     fi
 
     # FIPS mode
-    local fips_en; fips_en=$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo "0")
+    local fips_en; fips_en=$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)
+    [[ -z "$fips_en" ]] && fips_en="0"
     if [[ "$fips_en" == "1" ]]; then
         record_result "PASS" "STIG-FIPS-1" "FIPS 140-2/3 mode is enabled" \
             "SYSTEM INTEGRITY" "FIPS mode is active (fips_enabled=1)." ""
@@ -1258,7 +1328,8 @@ run_stig_checks() {
 
     # RHEL 9: crypto policy must not be overridden
     if rhel_ge 9; then
-        local cp; cp=$(update-crypto-policies --show 2>/dev/null || echo "N/A")
+        local cp; cp=$(update-crypto-policies --show 2>/dev/null)
+        [[ -z "$cp" ]] && cp="N/A"
         if [[ "$cp" == "FIPS" ]]; then
             record_result "PASS" "STIG-CRYPTO-1" "System crypto policy = FIPS" \
                 "SYSTEM INTEGRITY" "System-wide crypto policy is set to FIPS." ""
@@ -1343,9 +1414,12 @@ run_stig_checks() {
     banner "STIG — Medium Severity (CAT II) Key Checks"
 
     # SSH banner
-    local banner_file; banner_file=$(sshd -T 2>/dev/null | grep "^banner " | awk '{print $2}' || \
-        grep -iE "^\s*Banner\s+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "none")
-    if [[ "$banner_file" != "none" ]] && [[ "$banner_file" != "none" ]] && [[ -f "$banner_file" ]] && grep -qiE "authorized|consent|monitored|government" "$banner_file" 2>/dev/null; then
+    # `A | awk || B` never falls through: awk exits 0 even with no output.
+    local banner_file
+    banner_file=$(sshd -T 2>/dev/null | awk 'tolower($1)=="banner"{print $2; exit}')
+    [[ -z "$banner_file" ]] && banner_file=$(grep -iE "^[[:space:]]*Banner[[:space:]]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2; exit}')
+    [[ -z "$banner_file" ]] && banner_file="none"
+    if [[ "$banner_file" != "none" ]] && [[ -f "$banner_file" ]] && grep -qiE "authorized|consent|monitored|government" "$banner_file" 2>/dev/null; then
         record_result "PASS" "STIG-BNR-1" "SSH banner configured with consent language" \
             "ACCESS CONTROL" "SSH banner at $banner_file contains required text." ""
     elif [[ -f "$banner_file" ]]; then
@@ -1404,7 +1478,8 @@ run_stig_checks() {
 
     # sshd_config ownership (RHEL 9)
     if rhel_ge 9; then
-        local sshd_owner; sshd_owner=$(stat -Lc "%U:%G" /etc/ssh/sshd_config 2>/dev/null || echo "N/A")
+        local sshd_owner; sshd_owner=$(stat -Lc "%U:%G" /etc/ssh/sshd_config 2>/dev/null)
+        [[ -z "$sshd_owner" ]] && sshd_owner="N/A"
         if [[ "$sshd_owner" == "root:root" ]]; then
             record_result "PASS" "STIG-SSH-CFG-1" "sshd_config owned by root:root" \
                 "ACCESS CONTROL" "SSH server config has correct ownership." ""
@@ -1417,7 +1492,8 @@ run_stig_checks() {
 
     # Audit logs permissions
     if needs_root "STIG-AUD-LOG" "Check audit log file permissions" "AUDIT AND ACCOUNTABILITY"; then
-        local audit_dir; audit_dir=$(grep -E "^\s*log_file\s*=" /etc/audit/auditd.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' | xargs dirname 2>/dev/null || echo "/var/log/audit")
+        local audit_dir; audit_dir=$(grep -E "^\s*log_file\s*=" /etc/audit/auditd.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ' | xargs dirname 2>/dev/null)
+        [[ -z "$audit_dir" ]] && audit_dir="/var/log/audit"
         if [[ -d "$audit_dir" ]]; then
             local bad_audit; bad_audit=$(find "$audit_dir" -type f ! -perm 600 2>/dev/null | wc -l)
             if [[ "$bad_audit" -eq 0 ]]; then
@@ -1433,7 +1509,8 @@ run_stig_checks() {
 
     # Password aging — STIG requires max 60 days on RHEL 8/9
     if rhel_ge 8; then
-        local pass_max; pass_max=$(grep -E "^\s*PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}' || echo "N/A")
+        local pass_max; pass_max=$(grep -E "^\s*PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | tail -1 | awk '{print $2}')
+        [[ -z "$pass_max" ]] && pass_max="N/A"
         if [[ "$pass_max" =~ ^[0-9]+$ ]] && [[ "$pass_max" -le 60 ]]; then
             record_result "PASS" "STIG-PW-AGE" "PASS_MAX_DAYS = $pass_max (≤60)" \
                 "ACCESS CONTROL" "Password max age meets STIG requirement." ""
@@ -1446,7 +1523,8 @@ run_stig_checks() {
 
     # Password min length 15 (STIG)
     if rhel_ge 8; then
-        local pwq_minlen; pwq_minlen=$(grep -E "^\s*minlen\s*=" /etc/security/pwquality.conf 2>/dev/null | awk -F= '{print $2}' | tr -d ' ' || echo "N/A")
+        local pwq_minlen; pwq_minlen=$(grep -E "^\s*minlen\s*=" /etc/security/pwquality.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' ')
+        [[ -z "$pwq_minlen" ]] && pwq_minlen="N/A"
         if [[ "$pwq_minlen" =~ ^[0-9]+$ ]] && [[ "$pwq_minlen" -ge 15 ]]; then
             record_result "PASS" "STIG-PW-LEN" "pwquality minlen = $pwq_minlen (≥15)" \
                 "ACCESS CONTROL" "Password minimum length meets STIG requirement." ""
@@ -1557,11 +1635,13 @@ run_posture_checks() {
     banner "POSTURE — Account & Authentication Hygiene"
 
     # Interactive accounts with no expiry
+    if needs_root "POS-AUTH-1" "Interactive account expiry (chage)" "ACCESS CONTROL"; then
     local no_expiry=0
     while IFS=: read -r user _ uid _ _ _ shell; do
         [[ "$uid" -lt 1000 ]] && continue
         [[ "$shell" == "/sbin/nologin" || "$shell" == "/bin/false" ]] && continue
-        local exp; exp=$(chage -l "$user" 2>/dev/null | grep "Account expires" | awk -F: '{print $2}' | tr -d ' ' || echo "")
+        local exp; exp=$(chage -l "$user" 2>/dev/null | grep "Account expires" | awk -F: '{print $2}' | tr -d ' ')
+        [[ -z "$exp" ]] && exp=""
         [[ "$exp" == "never" ]] && no_expiry=$(( no_expiry + 1 ))
     done < /etc/passwd
     if [[ "$no_expiry" -eq 0 ]]; then
@@ -1571,6 +1651,7 @@ run_posture_checks() {
         record_result "WARN" "POS-AUTH-1" "$no_expiry interactive account(s) have no expiry" \
             "ACCESS CONTROL" "Some interactive accounts never expire." \
             "chage -E YYYY-MM-DD <username>"
+    fi
     fi
 
     # System accounts with shells
@@ -1602,7 +1683,8 @@ run_posture_checks() {
 
     # System crypto policy (RHEL 7+)
     if rhel_ge 7; then
-        local cp; cp=$(update-crypto-policies --show 2>/dev/null || echo "N/A")
+        local cp; cp=$(update-crypto-policies --show 2>/dev/null)
+        [[ -z "$cp" ]] && cp="N/A"
         case "$cp" in
             FIPS)    record_result "PASS" "POS-CRYPTO-1" "System crypto policy = FIPS" \
                          "SYSTEM INTEGRITY" "FIPS crypto policy is active." "" ;;
@@ -1656,7 +1738,8 @@ run_posture_checks() {
     fi
 
     # IPv6 status
-    local ipv6; ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
+    local ipv6; ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)
+    [[ -z "$ipv6" ]] && ipv6="0"
     if [[ "$ipv6" == "1" ]]; then
         record_result "INFO" "POS-NET-3" "IPv6 is disabled system-wide" \
             "NETWORK CONFIGURATION" "IPv6 is disabled." ""
@@ -1744,7 +1827,8 @@ run_hardening_scan() {
 
     # Password history (pam_pwhistory)
     if grep -rqE "pam_pwhistory|remember=" /etc/pam.d/ 2>/dev/null; then
-        local rem_val; rem_val=$(grep -rEh "remember=[0-9]+" /etc/pam.d/ 2>/dev/null | grep -oE "remember=[0-9]+" | head -1 | cut -d= -f2 || echo "0")
+        local rem_val; rem_val=$(grep -rEh "remember=[0-9]+" /etc/pam.d/ 2>/dev/null | grep -oE "remember=[0-9]+" | head -1 | cut -d= -f2)
+        [[ -z "$rem_val" ]] && rem_val="0"
         if [[ "$rem_val" =~ ^[0-9]+$ ]] && [[ "$rem_val" -ge 5 ]]; then
             record_result "PASS" "HRDN-AUTH-5" "Password history enforcement: remember=$rem_val (≥5)" \
                 "AUTHENTICATION" "Password reuse is restricted." ""
@@ -1760,7 +1844,8 @@ run_hardening_scan() {
     fi
 
     # login.defs SHA512 rounds
-    local rounds; rounds=$(grep -E "^\s*SHA_CRYPT_MIN_ROUNDS" /etc/login.defs 2>/dev/null | awk '{print $2}' || echo "0")
+    local rounds; rounds=$(grep -E "^\s*SHA_CRYPT_MIN_ROUNDS" /etc/login.defs 2>/dev/null | tail -1 | awk '{print $2}')
+    [[ -z "$rounds" ]] && rounds="0"
     if [[ "$rounds" =~ ^[0-9]+$ ]] && [[ "$rounds" -ge 5000 ]]; then
         record_result "PASS" "HRDN-AUTH-6" "SHA_CRYPT_MIN_ROUNDS = $rounds (≥5000)" \
             "AUTHENTICATION" "Sufficient password hashing rounds configured." ""
@@ -1785,7 +1870,8 @@ run_hardening_scan() {
     fi
 
     # systemd default target (should not be graphical on servers)
-    local def_target; def_target=$(systemctl get-default 2>/dev/null || echo "unknown")
+    local def_target; def_target=$(systemctl get-default 2>/dev/null)
+    [[ -z "$def_target" ]] && def_target="unknown"
     if [[ "$def_target" == "multi-user.target" ]]; then
         record_result "PASS" "HRDN-BOOT-2" "Default systemd target = multi-user (non-graphical)" \
             "CONFIGURATION MANAGEMENT" "System boots to CLI, not graphical environment." ""
@@ -1800,7 +1886,7 @@ run_hardening_scan() {
 
     # interactive boot disabled
     if grep -qE "^\s*PROMPT\s*=\s*no" /etc/sysconfig/init 2>/dev/null || \
-       grep -qE "systemd.confirm_spawn=0\|quiet" /proc/cmdline 2>/dev/null; then
+       grep -qE "systemd\.confirm_spawn=0|quiet" /proc/cmdline 2>/dev/null; then
         record_result "PASS" "HRDN-BOOT-3" "Interactive boot is disabled" \
             "CONFIGURATION MANAGEMENT" "System does not allow interactive boot prompts." ""
     else
@@ -1817,15 +1903,25 @@ run_hardening_scan() {
     local now_epoch; now_epoch=$(date +%s)
     while IFS= read -r certfile; do
         local exp_date exp_epoch
-        exp_date=$(run_to 3 openssl x509 -noout -enddate -in "$certfile" 2>/dev/null | cut -d= -f2) || continue
-        exp_epoch=$(date -d "$exp_date" +%s 2>/dev/null) || continue
+        # `A | cut || continue` never continues (cut exits 0 on empty input), and
+        # `date -d ""` returns *now* rather than failing — so a missing openssl or
+        # an unreadable cert scored days_left=0 and was counted as "expiring
+        # within 30 days". Test for an empty date explicitly.
+        exp_date=$(run_to 3 openssl x509 -noout -enddate -in "$certfile" 2>/dev/null | cut -d= -f2)
+        [[ -z "$exp_date" ]] && continue
+        exp_epoch=$(date -d "$exp_date" +%s 2>/dev/null)
+        [[ -z "$exp_epoch" ]] && continue
         local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
         if [[ "$days_left" -lt 0 ]]; then
             expired_certs=$(( expired_certs + 1 ))
         elif [[ "$days_left" -lt 30 ]]; then
             expiring_soon=$(( expiring_soon + 1 ))
         fi
-    done < <(find /etc/pki /etc/ssl -name "*.pem" -o -name "*.crt" 2>/dev/null | head -30)
+    # Bounded, SORTED sample: there are often 150+ trust-store certs and each
+    # one costs an openssl fork. Unsorted, `head -30` picked a different 30 on
+    # every host (and differed from the Python engine), so results were not
+    # reproducible. Sorting makes the sample stable and comparable.
+    done < <(find /etc/pki /etc/ssl -name "*.pem" -o -name "*.crt" 2>/dev/null | sort | head -30)
 
     if [[ "$expired_certs" -eq 0 && "$expiring_soon" -eq 0 ]]; then
         record_result "PASS" "HRDN-CRYP-1" "No expired or soon-expiring certificates found in /etc/pki" \
@@ -1840,7 +1936,8 @@ run_hardening_scan() {
     fi
 
     # OpenSSL version
-    local ossl_ver; ossl_ver=$(openssl version 2>/dev/null | awk '{print $2}' || echo "N/A")
+    local ossl_ver; ossl_ver=$(openssl version 2>/dev/null | awk '{print $2}')
+    [[ -z "$ossl_ver" ]] && ossl_ver="N/A"
     record_result "INFO" "HRDN-CRYP-3" "OpenSSL version: $ossl_ver" \
         "SYSTEM INTEGRITY" "Installed OpenSSL: $ossl_ver. Ensure it is patched." \
         "dnf update openssl"
@@ -1902,7 +1999,7 @@ run_hardening_scan() {
     banner "HARDENING [KRNL] — Kernel Extra Checks"
 
     # kernel.sysrq — should be 0 on production
-    local sysrq; sysrq=$(sysctl -n kernel.sysrq 2>/dev/null || echo "N/A")
+    local sysrq; sysrq=$(_sysctl_get kernel.sysrq)
     if [[ "$sysrq" == "0" ]]; then
         record_result "PASS" "HRDN-KRNL-1" "kernel.sysrq = 0 (disabled)" \
             "CONFIGURATION MANAGEMENT" "Magic SysRq key is disabled." ""
@@ -1913,7 +2010,7 @@ run_hardening_scan() {
     fi
 
     # kernel.core_uses_pid
-    local core_pid; core_pid=$(sysctl -n kernel.core_uses_pid 2>/dev/null || echo "N/A")
+    local core_pid; core_pid=$(_sysctl_get kernel.core_uses_pid)
     if [[ "$core_pid" == "1" ]]; then
         record_result "PASS" "HRDN-KRNL-2" "kernel.core_uses_pid = 1" \
             "CONFIGURATION MANAGEMENT" "Core dumps include PID in filename." ""
@@ -1925,7 +2022,7 @@ run_hardening_scan() {
 
     # Kernel module loading locked (RHEL 8+)
     if rhel_ge 8; then
-        local kexec_load; kexec_load=$(sysctl -n kernel.kexec_load_disabled 2>/dev/null || echo "N/A")
+        local kexec_load; kexec_load=$(_sysctl_get kernel.kexec_load_disabled)
         if [[ "$kexec_load" == "1" ]]; then
             record_result "PASS" "HRDN-KRNL-3" "kernel.kexec_load_disabled = 1" \
                 "CONFIGURATION MANAGEMENT" "Loading a new kernel for execution is disabled." ""
@@ -1952,7 +2049,7 @@ run_hardening_scan() {
 
     # auditd disk_full_action
     if [[ -f /etc/audit/auditd.conf ]]; then
-        local dfa; dfa=$(grep -iE "^\s*disk_full_action" /etc/audit/auditd.conf | awk -F= '{print $2}' | tr -d ' ')
+        local dfa; dfa=$(grep -iE "^\s*disk_full_action" /etc/audit/auditd.conf | tail -1 | awk -F= '{print $2}' | tr -d ' ')
         if echo "$dfa" | grep -qiE "halt|single|syslog"; then
             record_result "PASS" "HRDN-LOGG-2" "auditd disk_full_action = $dfa" \
                 "AUDIT AND ACCOUNTABILITY" "System takes action when audit disk is full." ""
@@ -1963,7 +2060,7 @@ run_hardening_scan() {
         fi
 
         # auditd admin_space_left_action
-        local asla; asla=$(grep -iE "^\s*admin_space_left_action" /etc/audit/auditd.conf | awk -F= '{print $2}' | tr -d ' ')
+        local asla; asla=$(grep -iE "^\s*admin_space_left_action" /etc/audit/auditd.conf | tail -1 | awk -F= '{print $2}' | tr -d ' ')
         if echo "$asla" | grep -qiE "halt|single|email|exec"; then
             record_result "PASS" "HRDN-LOGG-3" "auditd admin_space_left_action = $asla" \
                 "AUDIT AND ACCOUNTABILITY" "Admin notified when audit space is critically low." ""
@@ -2003,7 +2100,8 @@ run_hardening_scan() {
 
     # SELinux denials (recent)
     if command -v aureport &>/dev/null; then
-        local avc_count; avc_count=$(run_to 10 aureport --avc 2>/dev/null | tail -n +7 | wc -l || echo "0")
+        local avc_count; avc_count=$(run_to 10 aureport --avc 2>/dev/null | tail -n +7 | wc -l)
+        [[ -z "$avc_count" ]] && avc_count="0"
         if [[ "$avc_count" -eq 0 ]]; then
             record_result "PASS" "HRDN-MALW-2" "No recent SELinux AVC denials in audit log" \
                 "SYSTEM INTEGRITY" "aureport --avc shows no recent denials." ""
@@ -2018,7 +2116,8 @@ run_hardening_scan() {
     banner "HARDENING [PKGS] — Package Management"
 
     # Count installed packages (informational)
-    local pkg_count; pkg_count=$(rpm -qa 2>/dev/null | wc -l || echo "N/A")
+    local pkg_count; pkg_count=$(rpm -qa 2>/dev/null | wc -l)
+    [[ -z "$pkg_count" ]] && pkg_count="N/A"
     record_result "INFO" "HRDN-PKGS-1" "$pkg_count RPM packages installed" \
         "CONFIGURATION MANAGEMENT" "Minimise installed packages to reduce attack surface." \
         "Review: rpm -qa | sort  and remove unneeded packages"
@@ -2090,7 +2189,8 @@ run_hardening_scan() {
     fi
 
     # Shell history settings
-    local histsize; histsize=$(grep -rh "HISTSIZE" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | grep -v "^#" | grep -oE "[0-9]+" | sort -n | tail -1 || echo "N/A")
+    local histsize; histsize=$(grep -rh "HISTSIZE" /etc/profile /etc/bashrc /etc/profile.d/*.sh 2>/dev/null | grep -v "^#" | grep -oE "[0-9]+" | sort -n | tail -1)
+    [[ -z "$histsize" ]] && histsize="N/A"
     record_result "INFO" "HRDN-SHLL-3" "HISTSIZE = $histsize" \
         "AUDIT AND ACCOUNTABILITY" "Shell command history size." \
         "Set HISTSIZE=1000 and HISTFILESIZE=2000 in /etc/profile"
@@ -2130,7 +2230,7 @@ run_hardening_scan() {
     # chrony config — multiple NTP sources
     local ntp_servers=0
     if [[ -f /etc/chrony.conf ]]; then
-        ntp_servers=$(grep -cE "^\s*(server|pool)" /etc/chrony.conf 2>/dev/null || echo 0)
+        ntp_servers=$(grep -cE "^\s*(server|pool)" /etc/chrony.conf 2>/dev/null; true)
     elif [[ -f /etc/ntp.conf ]]; then
         ntp_servers=$(grep -cE "^\s*server" /etc/ntp.conf 2>/dev/null; true)
     fi
@@ -2223,7 +2323,8 @@ run_hardening_scan() {
     while IFS=: read -r user _ uid _ _ homedir _; do
         [[ "$uid" -lt 1000 ]] && continue
         [[ ! -d "$homedir" ]] && continue
-        local hperm; hperm=$(stat -Lc "%a" "$homedir" 2>/dev/null || echo "000")
+        local hperm; hperm=$(stat -Lc "%a" "$homedir" 2>/dev/null)
+        [[ -z "$hperm" ]] && hperm="000"
         # Should be 700 or 750 — not 755 or more permissive
         if [[ "$hperm" -gt 750 ]] 2>/dev/null; then
             bad_homes=$(( bad_homes + 1 ))
@@ -2364,7 +2465,7 @@ run_airgap_checks() {
     else
         local gw
         gw=$(awk 'function hx(x,  i,n){n=0; x=toupper(x); for(i=1;i<=length(x);i++) n=n*16+index("0123456789ABCDEF",substr(x,i,1))-1; return n}
-                  NR>1 && $2=="00000000" {g=$3; printf "%d.%d.%d.%d (%s) ", hx(substr(g,7,2)), hx(substr(g,5,2)), hx(substr(g,3,2)), hx(substr(g,1,2)), $1}' /proc/net/route 2>/dev/null)
+                  NR>1 && $2=="00000000" {g=$3; printf "%s%d.%d.%d.%d (%s)", (n++?" ":""), hx(substr(g,7,2)), hx(substr(g,5,2)), hx(substr(g,3,2)), hx(substr(g,1,2)), $1}' /proc/net/route 2>/dev/null)
         record_result "WARN" "AIR-NET-1" "Default route present (IPv4: $def4, IPv6: $def6)" \
             "NETWORK CONFIGURATION" "Default gateway(s): ${gw:-see ip route}. In an isolated enclave confirm this gateway cannot forward beyond the enclave boundary." \
             "Verify: ip route show default; remove if not required (nmcli con mod <con> ipv4.never-default yes)"
@@ -2647,6 +2748,8 @@ run_airgap_checks() {
         [[ -r "$tconf" ]] || continue
         srcs="$srcs $(awk '/^[[:space:]]*(server|pool|peer)[[:space:]]/ {print $2}' "$tconf")"
     done
+    # awk emits one source per line; normalise to a single space-separated list
+    srcs=$(printf '%s' "$srcs" | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')
     for h in $srcs; do _host_is_public "$h" && pub_t="$pub_t $h"; done
     if [[ -z "${srcs// /}" ]]; then
         record_result "WARN" "AIR-TIME-1" "No NTP time sources configured" \
@@ -2657,7 +2760,7 @@ run_airgap_checks() {
             "AUDIT AND ACCOUNTABILITY" "Public time pools are unreachable in an enclave; the clock will drift." \
             "Replace with internal time sources in /etc/chrony.conf"
     else
-        record_result "PASS" "AIR-TIME-1" "Time sources are internal:$srcs" \
+        record_result "PASS" "AIR-TIME-1" "Time sources are internal: $srcs" \
             "AUDIT AND ACCOUNTABILITY" "No public NTP pools referenced." ""
     fi
 
@@ -2755,6 +2858,7 @@ generate_json_report() {
         printf '{\n'
         printf '  "tool": "%s",\n'           "$TOOL_NAME"
         printf '  "version": "%s",\n'        "$TOOL_VERSION"
+        printf '  "engine": "%s",\n'         "$TOOL_ENGINE"
         printf '  "script_sha256": "%s",\n'  "$(_jstr "$SCRIPT_SHA256")"
         printf '  "hostname": "%s",\n'       "$(_jstr "$HOSTNAME_VAL")"
         printf '  "scan_date": "%s",\n'      "$(date -Iseconds 2>/dev/null || date)"
@@ -3023,6 +3127,7 @@ generate_bundle() {
     {
         echo "tool=$TOOL_NAME"
         echo "version=$TOOL_VERSION"
+        echo "engine=$TOOL_ENGINE"
         echo "script_sha256=$SCRIPT_SHA256"
         echo "hostname=$HOSTNAME_VAL"
         echo "os=$RHEL_FULL"

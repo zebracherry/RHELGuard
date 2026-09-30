@@ -1,5 +1,82 @@
 # Changelog
 
+## [2.3.0] — 2026-09-30 — PYTHON ENGINE + FALSE-POSITIVE FIXES
+
+### New
+- **`rhelguard.py` — a native Python engine.** Many hardened hosts will not run
+  `.sh` files (local policy, change control, or a transfer gateway that rejects
+  the extension). `rhelguard.py` is a full re-implementation, not a wrapper: it
+  does not shell out to `rhelguard.sh` or embed it. Python 3.6+, standard
+  library only, no pip, no network.
+  - Same check IDs, categories, findings and remediation text as the shell
+    engine, so a baseline captured with one can be diffed with the other
+    (`-b` accepts either engine's JSON).
+  - Verified on RHEL 9 (Python 3.9) and RHEL 8 (Python 3.6): both engines
+    produce identical results in every mode — `all`, `cis`, `stig`, `posture`,
+    `airgap` — as root and non-root.
+- Every report now records `engine` (`bash` or `python3`) in the JSON and in the
+  bundle `MANIFEST.txt`, so it is clear which produced a given result.
+- `.gitattributes` forces LF checkout. A Windows clone with the default
+  `core.autocrlf=true` rewrote the scripts to CRLF, and the shebang then failed
+  with `env: 'bash
+': No such file or directory`.
+
+### Fixed — false FAILs on correctly hardened hosts
+- **Duplicate config keys reported the wrong value.** `grep KEY file` returned
+  every match, newline-joined (e.g. `PASS_MAX_DAYS = "99999
+60"`), which then
+  failed every numeric test. Hardening scripts routinely *append* overrides, so
+  this hit ordinary hardened hosts: `PASS_WARN_AGE 7` twice reported FAIL.
+  Both engines now take the **last** definition, which is what shadow-utils,
+  libpwquality, pam_faillock, useradd defaults, systemd and dnf actually
+  honour (verified empirically). `sshd_config` keeps first-wins, per OpenSSH.
+  Affected `CIS-PW-1..5`, `CIS-PW-PQ`, `CIS-PW-FL1/2`, `CIS-ACC-5`,
+  `CIS-KERN-11`, `CIS-AUD-2/3`, `HRDN-LOGG-2/3`, `HRDN-AUTH-6`,
+  `STIG-PW-AGE`, `STIG-PW-LEN`.
+- **`/etc/shadow` mode 0000 always FAILed.** `stat -Lc %a` prints mode 0000 as
+  `0`, and the check compared it against the string `000` — so a correctly
+  locked RHEL 9 shadow file was reported non-compliant. Modes are now
+  normalised before comparison (`CIS-FILE-3`, `-4`, `-7`).
+- **Every kernel/network sysctl FAILed when `sysctl` was absent.** `sysctl`
+  ships in procps-ng, which minimal RHEL installs and UBI images omit; the old
+  code recorded `N/A` for all of them. Both engines now read `/proc/sys`
+  directly and fall back to the binary (`CIS-KERN-1..10`, `CIS-NET-1..22`,
+  `HRDN-KRNL-1..3`).
+- **Phantom "certificate expiring within 30 days".** `openssl … | cut || continue`
+  never continued (cut exits 0 on empty input) and `date -d ""` returns *now*
+  rather than failing, so an unreadable cert — or simply no `openssl` installed
+  — scored 0 days left and was counted as expiring (`HRDN-CRYP-2`).
+- **`POS-AUTH-1` silently passed as non-root.** It shelled out to `chage`, which
+  needs root to read `/etc/shadow`; every account then looked compliant. Now
+  gated with the root guard and reported as `SKIP (root required)`.
+
+### Fixed — checks that could not fire
+- **`hostname` was treated as a required tool and aborted the scan.** It is not
+  installed on RHEL minimal installs or UBI containers, so the script exited 1
+  with "Missing required tools" before running anything. It is now optional,
+  with a `uname -n` → `/proc/sys/kernel/hostname` → `$HOSTNAME` fallback chain.
+- `HRDN-BOOT-3` could never match `/proc/cmdline`: `\|` inside a `grep -E`
+  pattern is a *literal* pipe, so it searched for the string
+  `systemd.confirm_spawn=0|quiet`.
+- `STIG-BNR-1` and `CIS-SSH-MAT` never reached their `sshd_config` fallback:
+  in `sshd -T | awk … || grep …` the `||` never fires because `awk` exits 0 even
+  with no output. `MaxAuthTries` therefore read `N/A` on any host where
+  `sshd -T` was unavailable, and `STIG-BNR-1` had a duplicated condition.
+- ~35 other `x=$(… || echo "N/A")` assignments had the same dead-fallback bug
+  and left the value empty, so findings printed a blank where a value belonged.
+- `HRDN-TIME-1` — `grep -c … || echo 0` emitted `"0
+0"`, producing a bash
+  arithmetic error on stderr during the NTP-source count.
+
+### Changed
+- The certificate-expiry sample is now **sorted** before being capped at 30.
+  Unsorted, `head -30` examined a different 30 certificates depending on
+  filesystem traversal order, so the result was not reproducible between runs
+  or between engines.
+- `AIR-TIME-1` and `AIR-NET-1` no longer leak awk's newlines and trailing
+  spaces into the finding text.
+- Version is `2.3.0` for both engines; they are released and tested together.
+
 ## [2.2.0] — 2026-09-22 — AIR-GAP HARDENED RELEASE
 
 ### Fixed — scans that silently died
